@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tracing::{error, info};
 
 use crate::process::{CommandOutcome, CommandSpec, Runner, require_success};
@@ -62,6 +62,39 @@ impl<'a> ServiceManager<'a> {
             &format!("querying systemd unit {}", self.unit),
         )?;
         parse_state(&outcome.stdout)
+    }
+
+    /// Reads the version from the running service's executable.
+    pub fn running_fdctl_version(&self) -> Result<Option<String>> {
+        let outcome = require_success(
+            self.runner.capture(&CommandSpec::new("systemctl").args([
+                "show",
+                "--property=MainPID",
+                "--value",
+                "--",
+                self.unit,
+            ]))?,
+            &format!("querying main PID for {}", self.unit),
+        )?;
+        let pid =
+            outcome.stdout.trim().parse::<u32>().with_context(|| {
+                format!("systemctl returned an invalid MainPID for {}", self.unit)
+            })?;
+        if pid == 0 {
+            return Ok(None);
+        }
+
+        let executable = format!("/proc/{pid}/exe");
+        let version = require_success(
+            self.runner
+                .capture(&CommandSpec::new(executable).arg("version"))?,
+            "querying the running fdctl version",
+        )?;
+        let version = version.stdout.trim();
+        if version.is_empty() {
+            bail!("running fdctl returned an empty version");
+        }
+        Ok(Some(version.to_owned()))
     }
 
     /// Starts the unit unless it is already active.
@@ -263,6 +296,21 @@ mod tests {
             parse_state("LoadState=not-found\nActiveState=inactive\n")?,
             ServiceState::Missing
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reads_version_from_the_running_process() -> Result<()> {
+        let runner = FakeRunner {
+            captures: Mutex::new(VecDeque::from([
+                CommandOutcome::success("4321\n"),
+                CommandOutcome::success("v1.2.3\n"),
+            ])),
+            interactive: Mutex::new(VecDeque::new()),
+        };
+        let manager = ServiceManager::new(&runner, "frankendancer.service", false);
+
+        assert_eq!(manager.running_fdctl_version()?.as_deref(), Some("v1.2.3"));
         Ok(())
     }
 

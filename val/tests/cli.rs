@@ -16,7 +16,7 @@ fn status_json_runs_end_to_end() {
     let systemctl = bin_dir.join("systemctl");
     fs::write(
         &systemctl,
-        "#!/bin/sh\nprintf 'LoadState=loaded\\nActiveState=active\\n'\n",
+        "#!/bin/sh\ncase \"$*\" in\n  *--property=MainPID*) printf '0\\n' ;;\n  *) printf 'LoadState=loaded\\nActiveState=active\\n' ;;\nesac\n",
     )
     .expect("fake systemctl");
     let mut permissions = fs::metadata(&systemctl)
@@ -73,6 +73,7 @@ fn status_json_runs_end_to_end() {
     );
     let status: Value = serde_json::from_slice(&output.stdout).expect("status JSON");
     assert_eq!(status["service"], "active");
+    assert!(status["running_fdctl_version"].is_null());
     assert_eq!(status["active_id_key"], bs58::encode(public).into_string());
     assert_eq!(status["snapshot_fetch"], true);
 

@@ -17,6 +17,7 @@ use crate::{paths::AppPaths, service::ServiceState};
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct StatusReport {
     pub service: String,
+    pub running_fdctl_version: Option<String>,
     pub active_id_key: String,
     pub identity_path: String,
     pub snapshot_fetch: bool,
@@ -33,7 +34,11 @@ pub enum SnapshotFetchSource {
 
 impl StatusReport {
     /// Loads service, identity, and snapshot-fetch status.
-    pub fn load(paths: &AppPaths, service_state: ServiceState) -> Result<Self> {
+    pub fn load(
+        paths: &AppPaths,
+        service_state: ServiceState,
+        running_fdctl_version: Option<String>,
+    ) -> Result<Self> {
         let config_text = fs::read_to_string(&paths.config).with_context(|| {
             format!(
                 "could not read active Firedancer config {}",
@@ -59,6 +64,7 @@ impl StatusReport {
 
         Ok(Self {
             service: service_state.to_string(),
+            running_fdctl_version,
             active_id_key,
             identity_path: identity_path.to_string_lossy().into_owned(),
             snapshot_fetch,
@@ -74,6 +80,13 @@ impl StatusReport {
             SnapshotFetchSource::FiredancerDefault => "Firedancer default",
         };
         writeln!(output, "service: {}", self.service)?;
+        writeln!(
+            output,
+            "running fdctl version: {}",
+            self.running_fdctl_version
+                .as_deref()
+                .unwrap_or("not running")
+        )?;
         writeln!(output, "active-id key: {}", self.active_id_key)?;
         writeln!(output, "identity path: {}", self.identity_path)?;
         writeln!(
@@ -245,8 +258,9 @@ mod tests {
             ),
         )?;
 
-        let report = StatusReport::load(&paths, ServiceState::Active)?;
+        let report = StatusReport::load(&paths, ServiceState::Active, Some("v1.2.3".to_owned()))?;
         assert_eq!(report.service, "active");
+        assert_eq!(report.running_fdctl_version.as_deref(), Some("v1.2.3"));
         assert_eq!(report.active_id_key, bs58::encode(public).into_string());
         assert!(!report.snapshot_fetch);
         assert_eq!(
@@ -275,7 +289,7 @@ mod tests {
             ),
         )?;
 
-        let report = StatusReport::load(&paths, ServiceState::Inactive)?;
+        let report = StatusReport::load(&paths, ServiceState::Inactive, None)?;
         assert!(report.snapshot_fetch);
         assert_eq!(
             report.snapshot_fetch_source,

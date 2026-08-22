@@ -81,6 +81,7 @@ lines in `val.log`.
 Prints:
 
 - systemd service state
+- the running service's `fdctl version` (read through `/proc/<pid>/exe`)
 - the active identity **public** key
 - identity keypair path
 - whether `[consensus].snapshot_fetch` is enabled
