@@ -85,9 +85,16 @@ impl<'a> ServiceManager<'a> {
         }
 
         let executable = format!("/proc/{pid}/exe");
+        let command = if self.run_as_root {
+            CommandSpec::new(executable).arg("version")
+        } else {
+            CommandSpec::new("sudo")
+                .arg("--")
+                .arg(executable)
+                .arg("version")
+        };
         let version = require_success(
-            self.runner
-                .capture(&CommandSpec::new(executable).arg("version"))?,
+            self.runner.capture(&command)?,
             "querying the running fdctl version",
         )?;
         let version = version.stdout.trim();
