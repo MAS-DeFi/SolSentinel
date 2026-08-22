@@ -2,9 +2,88 @@
 
 use std::{env, fs, os::unix::fs::PermissionsExt, process::Command};
 
+use clap::CommandFactory;
+use clap_complete::{generate, shells::Bash};
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
 use tempfile::TempDir;
+
+#[allow(dead_code)]
+#[path = "../src/cli.rs"]
+mod cli;
+
+#[test]
+fn packaged_bash_completion_matches_cli() {
+    let mut generated = Vec::new();
+    let mut command = cli::Cli::command();
+    generate(Bash, &mut command, "val", &mut generated);
+
+    let completion_path = format!("{}/completions/val", env!("CARGO_MANIFEST_DIR"));
+    let packaged = fs::read(&completion_path).expect("packaged Bash completion");
+    assert_eq!(
+        generated, packaged,
+        "regenerate with: cargo run --example generate-bash-completion > completions/val"
+    );
+
+    let syntax_check = Command::new("bash")
+        .args(["-n", &completion_path])
+        .output()
+        .expect("check Bash completion syntax");
+    assert!(
+        syntax_check.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&syntax_check.stderr)
+    );
+}
+
+#[test]
+fn installer_bundles_binary_and_bash_completion() {
+    let temp = TempDir::new().expect("temporary directory");
+    let bin_dir = temp.path().join("usr/local/bin");
+    let completion_dir = temp.path().join("usr/share/bash-completion/completions");
+    let installer = format!("{}/install.sh", env!("CARGO_MANIFEST_DIR"));
+
+    let output = Command::new("sh")
+        .arg(installer)
+        .env("VAL_BINARY", env!("CARGO_BIN_EXE_val"))
+        .env("VAL_BIN_DIR", &bin_dir)
+        .env("VAL_BASH_COMPLETION_DIR", &completion_dir)
+        .output()
+        .expect("run val installer");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let installed_binary = bin_dir.join("val");
+    let installed_completion = completion_dir.join("val");
+    assert_eq!(
+        fs::read(&installed_binary).expect("installed val binary"),
+        fs::read(env!("CARGO_BIN_EXE_val")).expect("built val binary")
+    );
+    assert_eq!(
+        fs::read(&installed_completion).expect("installed Bash completion"),
+        fs::read(format!("{}/completions/val", env!("CARGO_MANIFEST_DIR")))
+            .expect("packaged Bash completion")
+    );
+    assert_eq!(
+        fs::metadata(installed_binary)
+            .expect("installed binary metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(installed_completion)
+            .expect("installed completion metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+}
 
 #[test]
 fn status_json_runs_end_to_end() {

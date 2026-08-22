@@ -16,6 +16,7 @@ All paths and the unit name can be overridden with global CLI options.
 
 - Linux with systemd
 - Git, GNU Make, and `sudo`
+- Bash with the standard `bash-completion` package for tab completion
 - Rust 1.89 or newer to build
 - An existing Firedancer checkout and active config
 
@@ -28,8 +29,12 @@ root-owned build artifacts.
 
 ```sh
 cargo build --release --locked --manifest-path val/Cargo.toml
-sudo install -m 0755 val/target/release/val /usr/local/bin/val
+sudo val/install.sh
 ```
+
+The installer installs the binary to `/usr/local/bin/val` and its Bash
+completion to `/usr/share/bash-completion/completions/val`. Completion is
+loaded by Bash automatically; operators do not run a separate setup command.
 
 ## Commands
 
@@ -114,3 +119,16 @@ val status --json
 Set `RUST_LOG` to override the log level when deeper diagnostics are needed.
 Logs are mode `0600`, rotate at 25 MiB, and retain five backups. A process
 lock prevents update, build, service, and status operations from overlapping.
+
+## Maintaining Bash completion
+
+The packaged completion is generated from the Clap command definitions and
+checked into `completions/val`. When the CLI changes, regenerate it from the
+repository root:
+
+```sh
+cargo run --locked --manifest-path val/Cargo.toml \
+  --example generate-bash-completion > val/completions/val
+```
+
+The test suite rejects an out-of-date completion file.
