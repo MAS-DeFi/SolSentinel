@@ -26,6 +26,9 @@ var/
 # Output directory
 output/
 
+# Rust
+val/target/
+
 # IDE
 .idea/
 .vscode/

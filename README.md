@@ -104,16 +104,35 @@ Detects whether a system reboot is needed to complete the installation of critic
 - **Recommended Action:** Schedule and perform a reboot whenever this check reports "required" to ensure the system is running the latest code.  
 
 ## Flows
+### Rust Firedancer CLI
+
+The production Rust CLI in [`val/`](val/) provides the focused Firedancer
+maintenance workflow:
+
+```sh
+export FIREDANCER_REF=vX.Y.Z
+val stop_firedancer
+val update_firedancer "$FIREDANCER_REF"
+val make_firedancer
+val configure_firedancer
+val start_firedancer
+val status
+```
+
+See [`val/README.md`](val/README.md) for build, installation, configuration,
+logging, and command behavior.
+
 ### Update Firedancer flow  
 ```sh
 cd ~/SolSentinel/actions
+export FIREDANCER_REF=vX.Y.Z
 
 # Schedule a maintenance window and stop the validator before replacing it.
 sudo systemctl stop frankendancer.service
 
 # Fetch the release and install its dependencies. Approve the deps.sh prompt
 # if asked. Run as the validator user; using sudo is also supported.
-./update-firedancer.sh v<version>
+./update-firedancer.sh "$FIREDANCER_REF"
 
 # Build Firedancer. This typically takes about 3.5 minutes.
 ./make-firedancer.sh
