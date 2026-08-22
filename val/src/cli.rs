@@ -48,7 +48,6 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     /// Fetch a Firedancer git ref, check it out, update submodules, and run deps.sh.
-    #[command(name = "update_firedancer", visible_alias = "update-firedancer")]
     UpdateFiredancer {
         /// Git tag, branch, or commit to check out.
         #[arg(value_name = "GIT_REF")]
@@ -56,19 +55,15 @@ pub enum Commands {
     },
 
     /// Build the fdctl and solana targets.
-    #[command(name = "make_firedancer", visible_alias = "make-firedancer")]
     MakeFiredancer,
 
     /// Initialize all Firedancer host configuration stages.
-    #[command(name = "configure_firedancer", visible_alias = "configure-firedancer")]
     ConfigureFiredancer,
 
     /// Start the Firedancer systemd service, if it is not already active.
-    #[command(name = "start_firedancer", visible_alias = "start-firedancer")]
     StartFiredancer,
 
     /// Stop the Firedancer systemd service, if it is not already inactive.
-    #[command(name = "stop_firedancer", visible_alias = "stop-firedancer")]
     StopFiredancer,
 
     /// Show service state, active identity public key, and snapshot-fetch state.
@@ -91,11 +86,11 @@ impl Commands {
     /// Returns the stable command name used in logs.
     pub fn name(&self) -> &'static str {
         match self {
-            Self::UpdateFiredancer { .. } => "update_firedancer",
-            Self::MakeFiredancer => "make_firedancer",
-            Self::ConfigureFiredancer => "configure_firedancer",
-            Self::StartFiredancer => "start_firedancer",
-            Self::StopFiredancer => "stop_firedancer",
+            Self::UpdateFiredancer { .. } => "update-firedancer",
+            Self::MakeFiredancer => "make-firedancer",
+            Self::ConfigureFiredancer => "configure-firedancer",
+            Self::StartFiredancer => "start-firedancer",
+            Self::StopFiredancer => "stop-firedancer",
             Self::Status { .. } => "status",
         }
     }

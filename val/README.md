@@ -41,17 +41,15 @@ loaded by Bash automatically; operators do not run a separate setup command.
 Use a maintenance window for the full lifecycle:
 
 ```sh
-val stop_firedancer
-val update_firedancer v0.708.30009
-val make_firedancer
-val configure_firedancer
-val start_firedancer
+val stop-firedancer
+val update-firedancer v0.708.30009
+val make-firedancer
+val configure-firedancer
+val start-firedancer
 val status
 ```
 
-Hyphenated aliases such as `update-firedancer` are also accepted.
-
-### `update_firedancer <GIT_REF>`
+### `update-firedancer <GIT_REF>`
 
 1. Verifies the checkout is a Git working tree.
 2. Refuses tracked, staged, or untracked local changes.
@@ -63,18 +61,18 @@ Hyphenated aliases such as `update-firedancer` are also accepted.
 The command is safe to repeat for the same ref. Dependency installation is
 still run on repeats so an interrupted first attempt can repair itself.
 
-### `make_firedancer`
+### `make-firedancer`
 
 Runs `make -j fdctl solana`, streams output to the terminal and log, and
 propagates build failure as a non-zero exit. It does not stop or restart the
 validator.
 
-### `configure_firedancer`
+### `configure-firedancer`
 
 Validates the built `fdctl` and active config, then runs:
 `sudo fdctl configure init all --config <active-config>`.
 
-### `start_firedancer` / `stop_firedancer`
+### `start-firedancer` / `stop-firedancer`
 
 Checks the systemd unit before taking action. Starting an active service and
 stopping an inactive service are successful no-ops. After a state change, the

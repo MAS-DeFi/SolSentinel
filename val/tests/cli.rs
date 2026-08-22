@@ -86,6 +86,38 @@ fn installer_bundles_binary_and_bash_completion() {
 }
 
 #[test]
+fn lifecycle_commands_use_hyphens_only() {
+    let commands = [
+        ("update-firedancer", "update_firedancer"),
+        ("make-firedancer", "make_firedancer"),
+        ("configure-firedancer", "configure_firedancer"),
+        ("start-firedancer", "start_firedancer"),
+        ("stop-firedancer", "stop_firedancer"),
+    ];
+
+    for (canonical, removed) in commands {
+        let accepted = Command::new(env!("CARGO_BIN_EXE_val"))
+            .args([canonical, "--help"])
+            .output()
+            .expect("run canonical command help");
+        assert!(
+            accepted.status.success(),
+            "{canonical} stderr: {}",
+            String::from_utf8_lossy(&accepted.stderr)
+        );
+
+        let rejected = Command::new(env!("CARGO_BIN_EXE_val"))
+            .args([removed, "--help"])
+            .output()
+            .expect("run removed command help");
+        assert!(
+            !rejected.status.success(),
+            "removed command {removed} was unexpectedly accepted"
+        );
+    }
+}
+
+#[test]
 fn status_json_runs_end_to_end() {
     let temp = TempDir::new().expect("temporary directory");
     let bin_dir = temp.path().join("bin");

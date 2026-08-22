@@ -17,37 +17,22 @@ _val() {
                 cmd="val"
                 ;;
             val,configure-firedancer)
-                cmd="val__subcmd__configure_firedancer"
-                ;;
-            val,configure_firedancer)
-                cmd="val__subcmd__configure_firedancer"
+                cmd="val__subcmd__configure__subcmd__firedancer"
                 ;;
             val,make-firedancer)
-                cmd="val__subcmd__make_firedancer"
-                ;;
-            val,make_firedancer)
-                cmd="val__subcmd__make_firedancer"
+                cmd="val__subcmd__make__subcmd__firedancer"
                 ;;
             val,start-firedancer)
-                cmd="val__subcmd__start_firedancer"
-                ;;
-            val,start_firedancer)
-                cmd="val__subcmd__start_firedancer"
+                cmd="val__subcmd__start__subcmd__firedancer"
                 ;;
             val,status)
                 cmd="val__subcmd__status"
                 ;;
             val,stop-firedancer)
-                cmd="val__subcmd__stop_firedancer"
-                ;;
-            val,stop_firedancer)
-                cmd="val__subcmd__stop_firedancer"
+                cmd="val__subcmd__stop__subcmd__firedancer"
                 ;;
             val,update-firedancer)
-                cmd="val__subcmd__update_firedancer"
-                ;;
-            val,update_firedancer)
-                cmd="val__subcmd__update_firedancer"
+                cmd="val__subcmd__update__subcmd__firedancer"
                 ;;
             *)
                 ;;
@@ -56,7 +41,7 @@ _val() {
 
     case "${cmd}" in
         val)
-            opts="-v -h -V --base-path --repo-path --config --log-dir --service --verbose --help --version update_firedancer update-firedancer make_firedancer make-firedancer configure_firedancer configure-firedancer start_firedancer start-firedancer stop_firedancer stop-firedancer status"
+            opts="-v -h -V --base-path --repo-path --config --log-dir --service --verbose --help --version update-firedancer make-firedancer configure-firedancer start-firedancer stop-firedancer status"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -89,7 +74,7 @@ _val() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        val__subcmd__configure_firedancer)
+        val__subcmd__configure__subcmd__firedancer)
             opts="-v -h --base-path --repo-path --config --log-dir --service --verbose --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -123,7 +108,7 @@ _val() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        val__subcmd__make_firedancer)
+        val__subcmd__make__subcmd__firedancer)
             opts="-v -h --base-path --repo-path --config --log-dir --service --verbose --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -157,7 +142,7 @@ _val() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        val__subcmd__start_firedancer)
+        val__subcmd__start__subcmd__firedancer)
             opts="-v -h --base-path --repo-path --config --log-dir --service --verbose --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -225,7 +210,7 @@ _val() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        val__subcmd__stop_firedancer)
+        val__subcmd__stop__subcmd__firedancer)
             opts="-v -h --base-path --repo-path --config --log-dir --service --verbose --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -259,7 +244,7 @@ _val() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        val__subcmd__update_firedancer)
+        val__subcmd__update__subcmd__firedancer)
             opts="-v -h --base-path --repo-path --config --log-dir --service --verbose --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

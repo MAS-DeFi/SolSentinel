@@ -111,11 +111,11 @@ maintenance workflow:
 
 ```sh
 export FIREDANCER_REF=vX.Y.Z
-val stop_firedancer
-val update_firedancer "$FIREDANCER_REF"
-val make_firedancer
-val configure_firedancer
-val start_firedancer
+val stop-firedancer
+val update-firedancer "$FIREDANCER_REF"
+val make-firedancer
+val configure-firedancer
+val start-firedancer
 val status
 ```
 
