@@ -177,7 +177,8 @@ val monitor --all
 
 The URL comes from the active config's `[tiles.gui]` listen address, defaulting
 to `ws://127.0.0.1:80/websocket`. Override it with `--url`. The GUI tile must
-be enabled and the validator must be running.
+be enabled. If the validator restarts or the GUI is down, `monitor` prints
+`service not available; retrying` and keeps trying until it can reconnect.
 
 ## Global options
 

@@ -3,9 +3,10 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::{self, Write},
+    io::{self, ErrorKind, Write},
     path::Path,
-    time::Instant,
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -16,6 +17,7 @@ use tungstenite::{Message, connect};
 
 const DEFAULT_GUI_ADDRESS: &str = "127.0.0.1";
 const DEFAULT_GUI_PORT: u16 = 80;
+const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Connects to the Firedancer GUI websocket and prints boot/startup state.
 pub fn run(config_path: &Path, url_override: Option<&str>, all: bool) -> Result<()> {
@@ -114,13 +116,17 @@ fn websocket_url(address: &str, port: u16) -> String {
 }
 
 fn watch(url: &str, all: bool, out: &mut impl Write) -> Result<()> {
-    let (mut socket, _response) = connect(url).with_context(|| {
-        format!(
-            "could not connect to Firedancer GUI at {url}. Is the validator running with [tiles.gui] enabled?"
-        )
-    })?;
+    watch_with_retry(url, all, out, RETRY_INTERVAL, None)
+}
+
+fn watch_with_retry(
+    url: &str,
+    all: bool,
+    out: &mut impl Write,
+    retry_interval: Duration,
+    max_sessions: Option<usize>,
+) -> Result<()> {
     let started = Instant::now();
-    writeln!(out, "+{:.1}s  connected  {url}", elapsed_secs(started))?;
     if all {
         writeln!(out, "dumping every websocket message; Ctrl+C to stop")?;
     } else {
@@ -129,6 +135,56 @@ fn watch(url: &str, all: bool, out: &mut impl Write) -> Result<()> {
             "showing startup/boot progress; other keys listed once. Pass --all to dump every message. Ctrl+C to stop"
         )?;
     }
+    out.flush().context("could not write monitor output")?;
+
+    let mut unavailable = false;
+    let mut sessions = 0;
+    loop {
+        match watch_session(url, all, started, &mut unavailable, out) {
+            Ok(()) => {
+                sessions += 1;
+                if max_sessions.is_some_and(|max| sessions >= max) {
+                    return Ok(());
+                }
+                announce_unavailable(started, &mut unavailable, out)?;
+            }
+            Err(error) if is_unavailable(&error) => {
+                announce_unavailable(started, &mut unavailable, out)?;
+            }
+            Err(error) => return Err(error),
+        }
+        thread::sleep(retry_interval);
+    }
+}
+
+fn announce_unavailable(
+    started: Instant,
+    unavailable: &mut bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    if !*unavailable {
+        writeln!(
+            out,
+            "+{:.1}s  service not available; retrying",
+            elapsed_secs(started)
+        )?;
+        out.flush().context("could not write monitor output")?;
+        *unavailable = true;
+    }
+    Ok(())
+}
+
+fn watch_session(
+    url: &str,
+    all: bool,
+    started: Instant,
+    unavailable: &mut bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    let (mut socket, _response) =
+        connect(url).with_context(|| format!("could not connect to Firedancer GUI at {url}"))?;
+    *unavailable = false;
+    writeln!(out, "+{:.1}s  connected  {url}", elapsed_secs(started))?;
     out.flush().context("could not write monitor output")?;
 
     let mut hidden_keys = BTreeSet::new();
@@ -146,16 +202,14 @@ fn watch(url: &str, all: bool, out: &mut impl Write) -> Result<()> {
                 out.flush().context("could not write monitor output")?;
             }
             Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
-            Ok(Message::Close(_)) => break,
-            Err(error) if is_clean_disconnect(&error) => break,
+            Ok(Message::Close(_)) => return Ok(()),
+            Err(error) if is_unavailable_websocket(&error) => return Ok(()),
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("Firedancer GUI websocket {url} closed"));
             }
         }
     }
-    writeln!(out, "+{:.1}s  disconnected", elapsed_secs(started))?;
-    Ok(())
 }
 
 fn handle_text(
@@ -206,21 +260,71 @@ fn elapsed_secs(started: Instant) -> f64 {
     started.elapsed().as_secs_f64()
 }
 
-fn is_clean_disconnect(error: &tungstenite::Error) -> bool {
+fn is_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<tungstenite::Error>()
+            .is_some_and(is_unavailable_websocket)
+            || cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(is_unavailable_io)
+    })
+}
+
+fn is_unavailable_websocket(error: &tungstenite::Error) -> bool {
+    match error {
+        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => true,
+        tungstenite::Error::Io(io_error) => is_unavailable_io(io_error),
+        tungstenite::Error::Http(_)
+        | tungstenite::Error::HttpFormat(_)
+        | tungstenite::Error::Protocol(_) => true,
+        _ => false,
+    }
+}
+
+fn is_unavailable_io(error: &io::Error) -> bool {
     matches!(
-        error,
-        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed
+        error.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::TimedOut
+            | ErrorKind::NotConnected
+            | ErrorKind::AddrNotAvailable
+            | ErrorKind::WouldBlock
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, thread, time::Duration};
+    use std::{
+        io,
+        net::TcpListener,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use anyhow::Result;
     use tungstenite::{Message, accept};
 
-    use super::{GuiEndpoint, connect_address, is_progress_key, watch, websocket_url};
+    use super::{
+        GuiEndpoint, connect_address, is_progress_key, is_unavailable, watch_session,
+        watch_with_retry, websocket_url,
+    };
+
+    fn serve_one_session(server: TcpListener, payload: &'static str) {
+        thread::spawn(move || {
+            let (stream, _) = server.accept().expect("accept");
+            let mut socket = accept(stream).expect("websocket handshake");
+            socket
+                .send(Message::Text(payload.into()))
+                .expect("send payload");
+            socket.send(Message::Close(None)).expect("close");
+            thread::sleep(Duration::from_millis(50));
+        });
+    }
 
     #[test]
     fn uses_firedancer_gui_defaults() -> Result<()> {
@@ -279,6 +383,15 @@ mod tests {
     }
 
     #[test]
+    fn connection_refused_is_unavailable() {
+        let error = anyhow::Error::from(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
+        assert!(is_unavailable(&error));
+    }
+
+    #[test]
     fn prints_startup_progress_and_hides_other_keys() -> Result<()> {
         let server = TcpListener::bind("127.0.0.1:0")?;
         let addr = server.local_addr()?;
@@ -306,7 +419,8 @@ mod tests {
         });
 
         let mut output = Vec::new();
-        watch(&url, false, &mut output)?;
+        let mut unavailable = false;
+        watch_session(&url, false, Instant::now(), &mut unavailable, &mut output)?;
         thread.join().expect("server thread");
 
         let text = String::from_utf8(output)?;
@@ -323,7 +437,6 @@ mod tests {
             1,
             "{text}"
         );
-        assert!(text.contains("disconnected"), "{text}");
         Ok(())
     }
 
@@ -332,26 +445,50 @@ mod tests {
         let server = TcpListener::bind("127.0.0.1:0")?;
         let addr = server.local_addr()?;
         let url = format!("ws://{addr}/websocket");
-        let thread = thread::spawn(move || {
-            let (stream, _) = server.accept().expect("accept");
-            let mut socket = accept(stream).expect("websocket handshake");
-            socket
-                .send(Message::Text(
-                    r#"{"topic":"summary","key":"cluster","value":"testnet"}"#.into(),
-                ))
-                .expect("send cluster");
-            socket.send(Message::Close(None)).expect("close");
-            thread::sleep(Duration::from_millis(50));
-        });
+        serve_one_session(
+            server,
+            r#"{"topic":"summary","key":"cluster","value":"testnet"}"#,
+        );
 
         let mut output = Vec::new();
-        watch(&url, true, &mut output)?;
-        thread.join().expect("server thread");
+        let mut unavailable = false;
+        watch_session(&url, true, Instant::now(), &mut unavailable, &mut output)?;
 
         let text = String::from_utf8(output)?;
         assert!(text.contains("summary.cluster"), "{text}");
         assert!(text.contains("testnet"), "{text}");
         assert!(!text.contains("[hidden;"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn reconnects_after_the_service_drops() -> Result<()> {
+        let server = TcpListener::bind("127.0.0.1:0")?;
+        let addr = server.local_addr()?;
+        let url = format!("ws://{addr}/websocket");
+        let thread = thread::spawn(move || {
+            for payload in [
+                r#"{"topic":"summary","key":"startup_progress","value":{"phase":"downloading_full_snapshot"}}"#,
+                r#"{"topic":"summary","key":"startup_progress","value":{"phase":"running"}}"#,
+            ] {
+                let (stream, _) = server.accept().expect("accept");
+                let mut socket = accept(stream).expect("websocket handshake");
+                socket
+                    .send(Message::Text(payload.into()))
+                    .expect("send payload");
+                socket.send(Message::Close(None)).expect("close");
+            }
+        });
+
+        let mut output = Vec::new();
+        watch_with_retry(&url, false, &mut output, Duration::from_millis(20), Some(2))?;
+        thread.join().expect("server thread");
+
+        let text = String::from_utf8(output)?;
+        assert_eq!(text.matches("connected").count(), 2, "{text}");
+        assert!(text.contains("service not available; retrying"), "{text}");
+        assert!(text.contains("downloading_full_snapshot"), "{text}");
+        assert!(text.contains("\"phase\": \"running\""), "{text}");
         Ok(())
     }
 }
