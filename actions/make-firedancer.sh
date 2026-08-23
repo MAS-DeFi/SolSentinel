@@ -23,6 +23,12 @@ log "📁 Repository: $REPO_DIR"
 log "🛠️  Building fdctl and solana..."
 cd "$REPO_DIR" || { log "❌ ERROR: Could not change directory to $REPO_DIR"; exit 1; }
 
+# Wipe previous compile output so a version switch cannot mix stale objects
+# into the new binaries. Do not touch opt/: that is deps.sh, not make.
+BUILD_DIR="$REPO_DIR/build"
+log "🧹 Removing $BUILD_DIR for a clean build..."
+rm -rf -- "$BUILD_DIR" || { log "❌ ERROR: Could not remove $BUILD_DIR"; exit 1; }
+
 # Start timing the make command
 START_TIME=$(date +%s)
 make -j fdctl solana 2>&1 | tee -a "$LOG_FILE"

@@ -71,9 +71,9 @@ still run on repeats so an interrupted first attempt can repair itself.
 
 ### `make-firedancer`
 
-Runs `make -j fdctl solana`, streams output to the terminal and log, and
-propagates build failure as a non-zero exit. It does not stop or restart the
-validator.
+Removes `<repo>/build` if it exists, then runs `make -j fdctl solana`, streams
+output to the terminal and log, and propagates build failure as a non-zero
+exit. `opt/` is left in place. It does not stop or restart the validator.
 
 ### `configure-firedancer`
 

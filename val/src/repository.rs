@@ -101,6 +101,7 @@ pub fn update_firedancer(runner: &dyn Runner, repository: &Path, git_ref: &str) 
 /// Builds Firedancer and returns the elapsed duration.
 pub fn make_firedancer(runner: &dyn Runner, repository: &Path) -> Result<Duration> {
     validate_repository(runner, repository)?;
+    remove_build_directory(repository)?;
 
     let started = Instant::now();
     info!(repository = %repository.display(), "building Firedancer");
@@ -150,6 +151,27 @@ pub fn built_fdctl_version(runner: &dyn Runner, repository: &Path) -> Result<Opt
         bail!("built fdctl returned an empty version");
     }
     Ok(Some(version.to_owned()))
+}
+
+/// Removes `<repository>/build` so the next make cannot reuse stale objects.
+///
+/// Missing `build/` is success: a first build or a previous wipe should not
+/// abort. `opt/` is left in place because it is produced by `deps.sh`.
+fn remove_build_directory(repository: &Path) -> Result<()> {
+    let build = repository.join("build");
+    match fs::remove_dir_all(&build) {
+        Ok(()) => {
+            info!(path = %build.display(), "removed Firedancer build directory");
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "could not remove Firedancer build directory: {}",
+                build.display()
+            )
+        }),
+    }
 }
 
 /// Verifies that the configured path is a Git working tree.
@@ -334,8 +356,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        built_fdctl_version, reset_managed_worktree, resolve_git_ref, update_firedancer,
-        validate_git_ref,
+        built_fdctl_version, make_firedancer, reset_managed_worktree, resolve_git_ref,
+        update_firedancer, validate_git_ref,
     };
     use crate::process::{CommandOutcome, CommandSpec, Runner, SystemRunner};
 
@@ -794,6 +816,54 @@ mod tests {
         assert_eq!(captures[0].program, fdctl.as_os_str());
         assert_eq!(captures[0].args, ["version"]);
         assert_eq!(captures[0].cwd.as_deref(), Some(repository.path()));
+        Ok(())
+    }
+
+    #[test]
+    fn make_removes_existing_build_directory_before_compiling() -> Result<()> {
+        let repository = TempDir::new()?;
+        let artifact = repository.path().join("build/native/gcc/bin/fdctl");
+        fs::create_dir_all(artifact.parent().expect("fdctl parent"))?;
+        fs::write(&artifact, "stale\n")?;
+        fs::create_dir_all(repository.path().join("opt"))?;
+        fs::write(repository.path().join("opt/keep"), "deps\n")?;
+        let runner = FakeRunner {
+            captures: Mutex::new(VecDeque::from([CommandOutcome::success("true\n")])),
+            capture_specs: Mutex::new(Vec::new()),
+            streaming: Mutex::new(VecDeque::from([CommandOutcome::success("")])),
+            streaming_specs: Mutex::new(Vec::new()),
+            interactive: Mutex::new(VecDeque::new()),
+        };
+
+        make_firedancer(&runner, repository.path())?;
+
+        assert!(!repository.path().join("build").exists());
+        assert_eq!(
+            fs::read_to_string(repository.path().join("opt/keep"))?,
+            "deps\n"
+        );
+        let specs = runner.streaming_specs.lock().expect("streaming specs lock");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].program, "make");
+        assert_eq!(arg_strings(&specs[0]), ["-j", "fdctl", "solana"]);
+        assert_eq!(specs[0].cwd.as_deref(), Some(repository.path()));
+        Ok(())
+    }
+
+    #[test]
+    fn make_succeeds_when_build_directory_is_absent() -> Result<()> {
+        let repository = TempDir::new()?;
+        let runner = FakeRunner {
+            captures: Mutex::new(VecDeque::from([CommandOutcome::success("true\n")])),
+            capture_specs: Mutex::new(Vec::new()),
+            streaming: Mutex::new(VecDeque::from([CommandOutcome::success("")])),
+            streaming_specs: Mutex::new(Vec::new()),
+            interactive: Mutex::new(VecDeque::new()),
+        };
+
+        make_firedancer(&runner, repository.path())?;
+
+        assert!(!repository.path().join("build").exists());
         Ok(())
     }
 }

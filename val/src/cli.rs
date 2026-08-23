@@ -54,7 +54,7 @@ pub enum Commands {
         git_ref: String,
     },
 
-    /// Build the fdctl and solana targets.
+    /// Remove the Firedancer build directory, then build fdctl and solana.
     MakeFiredancer,
 
     /// Initialize all Firedancer host configuration stages.
