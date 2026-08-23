@@ -120,6 +120,23 @@ fn lifecycle_commands_use_hyphens_only() {
 }
 
 #[test]
+fn monitor_help_describes_websocket() {
+    let output = Command::new(env!("CARGO_BIN_EXE_val"))
+        .args(["monitor", "--help"])
+        .output()
+        .expect("run val monitor --help");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("websocket"), "{stdout}");
+    assert!(stdout.contains("--all"), "{stdout}");
+    assert!(stdout.contains("--url"), "{stdout}");
+}
+
+#[test]
 fn status_json_runs_end_to_end() {
     let temp = TempDir::new().expect("temporary directory");
     let bin_dir = temp.path().join("bin");

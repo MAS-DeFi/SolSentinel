@@ -82,6 +82,17 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Watch the Firedancer GUI websocket for boot and startup state.
+    Monitor {
+        /// Print every websocket message instead of only startup/boot progress.
+        #[arg(long)]
+        all: bool,
+
+        /// GUI websocket URL. Defaults to the active config listen address.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
 }
 
 impl Commands {
@@ -97,6 +108,11 @@ impl Commands {
         )
     }
 
+    /// Returns whether the command takes the exclusive val process lock.
+    pub fn holds_command_lock(&self) -> bool {
+        !matches!(self, Self::Monitor { .. })
+    }
+
     /// Returns the stable command name used in logs.
     pub fn name(&self) -> &'static str {
         match self {
@@ -108,6 +124,7 @@ impl Commands {
             Self::StopFiredancer => "stop-firedancer",
             Self::RestartFiredancer => "restart-firedancer",
             Self::Status { .. } => "status",
+            Self::Monitor { .. } => "monitor",
         }
     }
 }

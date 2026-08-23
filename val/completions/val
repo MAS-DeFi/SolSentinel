@@ -22,6 +22,9 @@ _val() {
             val,make-firedancer)
                 cmd="val__subcmd__make__subcmd__firedancer"
                 ;;
+            val,monitor)
+                cmd="val__subcmd__monitor"
+                ;;
             val,restart-firedancer)
                 cmd="val__subcmd__restart__subcmd__firedancer"
                 ;;
@@ -47,7 +50,7 @@ _val() {
 
     case "${cmd}" in
         val)
-            opts="-v -h -V --base-path --repo-path --config --log-dir --service --verbose --help --version update-firedancer update-full make-firedancer configure-firedancer start-firedancer stop-firedancer restart-firedancer status"
+            opts="-v -h -V --base-path --repo-path --config --log-dir --service --verbose --help --version update-firedancer update-full make-firedancer configure-firedancer start-firedancer stop-firedancer restart-firedancer status monitor"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -121,6 +124,44 @@ _val() {
                 return 0
             fi
             case "${prev}" in
+                --base-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --repo-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --config)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --log-dir)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --service)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        val__subcmd__monitor)
+            opts="-v -h --all --url --base-path --repo-path --config --log-dir --service --verbose --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --url)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --base-path)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0

@@ -4,6 +4,7 @@ mod cli;
 mod configure;
 mod lock;
 mod logging;
+mod monitor;
 mod paths;
 mod privilege;
 mod process;
@@ -47,14 +48,22 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let _command_lock = match lock::CommandLock::acquire(&paths.base) {
-        Ok(lock) => lock,
-        Err(error) => {
-            eprintln!("error: {error:#}");
-            return ExitCode::FAILURE;
+    let _command_lock = if cli.command.holds_command_lock() {
+        match lock::CommandLock::acquire(&paths.base) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                eprintln!("error: {error:#}");
+                return ExitCode::FAILURE;
+            }
         }
+    } else {
+        None
     };
-    let compact_terminal = matches!(&cli.command, Commands::UpdateFull { .. }) && cli.verbose == 0;
+    let compact_terminal = cli.verbose == 0
+        && matches!(
+            &cli.command,
+            Commands::UpdateFull { .. } | Commands::Monitor { .. }
+        );
     let _log_guard = match logging::init(&paths.log_dir, cli.verbose, compact_terminal) {
         Ok(guard) => guard,
         Err(error) => {
@@ -139,5 +148,6 @@ fn dispatch(cli: &Cli, paths: &AppPaths) -> Result<()> {
             }
             Ok(())
         }
+        Commands::Monitor { all, url } => monitor::run(&paths.config, url.as_deref(), *all),
     }
 }

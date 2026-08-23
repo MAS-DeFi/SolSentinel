@@ -157,6 +157,28 @@ For automation:
 val status --json
 ```
 
+### `monitor`
+
+Debug-watches the Firedancer GUI websocket and prints boot/startup state.
+This does not take the exclusive `val` lock, so `status` and other commands
+can still run.
+
+```sh
+val monitor
+```
+
+On connect it prints `summary.startup_progress` and `summary.boot_progress`
+payloads as they change. Other websocket keys are named once so you can see
+traffic without flooding the terminal. For a full dump:
+
+```sh
+val monitor --all
+```
+
+The URL comes from the active config's `[tiles.gui]` listen address, defaulting
+to `ws://127.0.0.1:80/websocket`. Override it with `--url`. The GUI tile must
+be enabled and the validator must be running.
+
 ## Global options
 
 ```text
