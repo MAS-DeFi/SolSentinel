@@ -19,7 +19,7 @@ const MAX_LOG_BYTES: u64 = 25 * 1024 * 1024;
 const LOG_BACKUPS: usize = 5;
 
 /// Initializes terminal and bounded file logging.
-pub fn init(log_dir: &Path, verbosity: u8) -> Result<WorkerGuard> {
+pub fn init(log_dir: &Path, verbosity: u8, compact_terminal: bool) -> Result<WorkerGuard> {
     fs::create_dir_all(log_dir)
         .with_context(|| format!("could not create log directory {}", log_dir.display()))?;
 
@@ -30,10 +30,14 @@ pub fn init(log_dir: &Path, verbosity: u8) -> Result<WorkerGuard> {
         .lossy(false)
         .finish(file_appender);
 
-    let default_filter = match verbosity {
-        0 => "info",
-        1 => "debug",
-        _ => "trace",
+    let default_filter = if compact_terminal && verbosity == 0 {
+        "warn".to_owned()
+    } else {
+        match verbosity {
+            0 => "info".to_owned(),
+            1 => "debug".to_owned(),
+            _ => "trace".to_owned(),
+        }
     };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));

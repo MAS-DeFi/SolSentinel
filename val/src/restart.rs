@@ -3,30 +3,88 @@
 use std::path::Path;
 
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{configure, process::Runner, service::ServiceManager};
+
+/// One restart segment surfaced to progress reporters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartPhase {
+    Stop,
+    ConfigureFirst,
+    ConfigureSecond,
+    Start,
+}
+
+/// Receives restart segment transitions for compact progress output.
+pub trait RestartReporter {
+    /// Called immediately before a restart segment begins.
+    fn on_phase(&self, phase: RestartPhase);
+
+    /// Called when the first configure pass fails but the second pass will run.
+    fn on_configure_first_failed(&self);
+}
 
 /// Stops the service, runs configure-firedancer twice, then starts it.
 ///
 /// Host configuration is applied twice because some Firedancer stages only
-/// finish after an earlier pass has taken effect. Failure after stop leaves
-/// the service stopped.
+/// finish after an earlier pass has taken effect. A first-pass configure
+/// failure is logged and reported, but the second pass still runs. Failure
+/// after stop leaves the service stopped.
 pub fn restart_firedancer(
     runner: &dyn Runner,
     service: &ServiceManager<'_>,
     repository: &Path,
     config: &Path,
 ) -> Result<()> {
+    restart_firedancer_with_reporter(runner, service, repository, config, None)
+}
+
+/// Stops the service, configures twice, and starts it with optional progress hooks.
+pub fn restart_firedancer_with_reporter(
+    runner: &dyn Runner,
+    service: &ServiceManager<'_>,
+    repository: &Path,
+    config: &Path,
+    reporter: Option<&dyn RestartReporter>,
+) -> Result<()> {
     info!("restarting Firedancer (stop, configure, configure, start)");
+
     info!("starting restart segment: stop");
     service.stop()?;
+    if let Some(reporter) = reporter {
+        reporter.on_phase(RestartPhase::Stop);
+    }
+
     info!("starting restart segment: configure 1/2");
-    configure::configure_firedancer(runner, repository, config)?;
+    match configure::configure_firedancer(runner, repository, config) {
+        Ok(()) => {
+            if let Some(reporter) = reporter {
+                reporter.on_phase(RestartPhase::ConfigureFirst);
+            }
+        }
+        Err(first_error) => {
+            warn!(
+                error = %format!("{first_error:#}"),
+                "first configure pass failed; continuing to second pass"
+            );
+            if let Some(reporter) = reporter {
+                reporter.on_configure_first_failed();
+            }
+        }
+    }
+
     info!("starting restart segment: configure 2/2");
     configure::configure_firedancer(runner, repository, config)?;
+    if let Some(reporter) = reporter {
+        reporter.on_phase(RestartPhase::ConfigureSecond);
+    }
+
     info!("starting restart segment: start");
     service.start()?;
+    if let Some(reporter) = reporter {
+        reporter.on_phase(RestartPhase::Start);
+    }
     info!("Firedancer restart completed");
     Ok(())
 }
@@ -204,27 +262,54 @@ mod tests {
     }
 
     #[test]
-    fn does_not_start_when_the_first_configure_fails() -> Result<()> {
+    fn continues_to_second_configure_when_the_first_fails() -> Result<()> {
         let repo = prepared_repo()?;
         let runner = FakeRunner::new(
-            vec![show("active"), show("inactive")],
+            vec![
+                show("active"),
+                show("inactive"),
+                show("inactive"),
+                show("active"),
+            ],
             vec![
                 CommandOutcome::success(""),
                 CommandOutcome::failure(1, "configure failed"),
+                CommandOutcome::success(""),
+                CommandOutcome::success(""),
             ],
         );
         let service = ServiceManager::new(&runner, "frankendancer.service", false);
 
-        let error = restart_firedancer(&runner, &service, &repo.repository, &repo.config)
-            .expect_err("first configure should fail");
-        assert!(
-            format!("{error:#}").contains("Firedancer host configuration failed"),
-            "{error:#}"
-        );
+        restart_firedancer(&runner, &service, &repo.repository, &repo.config)?;
+
         assert_eq!(
             runner.interactive_commands(),
-            [systemctl_spec("stop"), configure_spec(&repo)]
+            [
+                systemctl_spec("stop"),
+                configure_spec(&repo),
+                configure_spec(&repo),
+                systemctl_spec("start"),
+            ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fails_when_stop_does_not_complete() -> Result<()> {
+        let repo = prepared_repo()?;
+        let runner = FakeRunner::new(
+            vec![show("active"), show("activating")],
+            vec![CommandOutcome::failure(1, "stop failed")],
+        );
+        let service = ServiceManager::new(&runner, "frankendancer.service", false);
+
+        let error = restart_firedancer(&runner, &service, &repo.repository, &repo.config)
+            .expect_err("stop should fail");
+        assert!(
+            format!("{error:#}").contains("stopping frankendancer.service failed"),
+            "{error:#}"
+        );
+        assert_eq!(runner.interactive_commands(), [systemctl_spec("stop")]);
         Ok(())
     }
 

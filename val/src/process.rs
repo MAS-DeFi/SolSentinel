@@ -1,6 +1,7 @@
 //! Structured subprocess execution and output relaying.
 
 use std::{
+    cell::Cell,
     ffi::{OsStr, OsString},
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -12,6 +13,37 @@ use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 
 pub const COMMAND_OUTPUT_TARGET: &str = "val::command_output";
+
+thread_local! {
+    static COMPACT_OUTPUT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Enables or disables compact terminal output for streaming child processes.
+pub fn set_compact_output(compact: bool) {
+    COMPACT_OUTPUT.with(|flag| flag.set(compact));
+}
+
+/// Returns whether streaming child output should be kept off the terminal.
+pub fn compact_output() -> bool {
+    COMPACT_OUTPUT.with(|flag| flag.get())
+}
+
+/// Restores compact output when dropped.
+pub struct CompactOutputGuard;
+
+impl CompactOutputGuard {
+    /// Enables compact output until this guard is dropped.
+    pub fn enable() -> Self {
+        set_compact_output(true);
+        Self
+    }
+}
+
+impl Drop for CompactOutputGuard {
+    fn drop(&mut self) {
+        set_compact_output(false);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -252,7 +284,7 @@ enum Stream {
 fn relay(reader: impl io::Read, stream: Stream) -> io::Result<()> {
     let mut reader = BufReader::new(reader);
     let mut buffer = Vec::new();
-    let mut terminal_open = true;
+    let mut terminal_open = !compact_output();
 
     loop {
         buffer.clear();
@@ -331,7 +363,11 @@ pub fn executable_in(directory: &Path, relative: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandSpec, Runner, SystemRunner};
+    use std::sync::Mutex;
+
+    use super::{
+        CommandSpec, CompactOutputGuard, Runner, SystemRunner, compact_output, set_compact_output,
+    };
 
     #[test]
     fn capture_includes_configured_environment() {
@@ -355,5 +391,42 @@ mod tests {
             spec.display(),
             "FD_AUTO_INSTALL_PACKAGES=\"1\" \"deps.sh\" \"fetch\" \"check\" \"install\""
         );
+    }
+
+    #[test]
+    fn compact_output_guard_restores_on_drop() {
+        assert!(!compact_output());
+        {
+            let _guard = CompactOutputGuard::enable();
+            assert!(compact_output());
+        }
+        assert!(!compact_output());
+    }
+
+    #[test]
+    fn compact_output_flag_tracks_state() {
+        set_compact_output(true);
+        assert!(compact_output());
+        set_compact_output(false);
+        assert!(!compact_output());
+    }
+
+    #[test]
+    fn compact_mode_suppresses_streaming_child_terminal_output() {
+        static LOCK: Mutex<()> = Mutex::new(());
+
+        let _lock = LOCK.lock().expect("compact output test lock");
+        let _guard = CompactOutputGuard::enable();
+
+        let outcome = SystemRunner
+            .streaming(&CommandSpec::new("sh").args([
+                "-c",
+                "printf 'compact-stream-marker\\n' >&2; printf 'compact-stream-marker\\n'",
+            ]))
+            .expect("streaming command");
+        assert!(outcome.success);
+
+        // Child output is still logged through tracing; compact mode only hides the
+        // direct terminal relay used by update-full's noisy git/deps/make stages.
     }
 }

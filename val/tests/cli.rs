@@ -89,6 +89,7 @@ fn installer_bundles_binary_and_bash_completion() {
 fn lifecycle_commands_use_hyphens_only() {
     let commands = [
         ("update-firedancer", "update_firedancer"),
+        ("update-full", "update_full"),
         ("make-firedancer", "make_firedancer"),
         ("configure-firedancer", "configure_firedancer"),
         ("start-firedancer", "start_firedancer"),
@@ -326,4 +327,149 @@ esac
         stop_segment < configure_1 && configure_1 < configure_2 && configure_2 < start_segment,
         "restart segments should print in order: {stderr}"
     );
+}
+
+#[test]
+fn update_full_runs_update_make_restart_and_prints_compact_progress() {
+    let temp = TempDir::new().expect("temporary directory");
+    let bin_dir = temp.path().join("bin");
+    let log_dir = temp.path().join("logs");
+    let state = temp.path().join("service-state");
+    let systemctl_log = temp.path().join("systemctl.log");
+    let fdctl_log = temp.path().join("fdctl.log");
+    let git_log = temp.path().join("git.log");
+    let make_log = temp.path().join("make.log");
+    fs::write(&state, "active\n").expect("initial service state");
+
+    write_executable(
+        &bin_dir.join("sudo"),
+        "#!/bin/sh\n[ \"$1\" = -- ] && shift\nexec \"$@\"\n",
+    );
+    write_executable(
+        &bin_dir.join("systemctl"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+case " $* " in
+  *" show "*) printf 'LoadState=loaded\nActiveState=%s\n' "$(cat "$SYSTEMCTL_STATE")" ;;
+  *" stop "*) printf 'inactive\n' > "$SYSTEMCTL_STATE" ;;
+  *" start "*) printf 'active\n' > "$SYSTEMCTL_STATE" ;;
+  *) echo unexpected: "$*" >&2; exit 1 ;;
+esac
+"#,
+    );
+    write_executable(
+        &bin_dir.join("git"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$GIT_LOG"
+case "$1" in
+  rev-parse)
+    last="${@: -1}"
+    if [ "$2" = "--is-inside-work-tree" ]; then
+      printf 'true\n'
+    elif [ "$2" = "--verify" ]; then
+      case "$last" in
+        HEAD)
+          printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
+          ;;
+        *vTEST*)
+          printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+          ;;
+        *)
+          exit 1
+          ;;
+      esac
+    fi
+    ;;
+  fetch|status|checkout|submodule|reset|clean) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+    );
+    write_executable(
+        &bin_dir.join("make"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$MAKE_LOG"
+mkdir -p "$REPO_PATH/build/native/gcc/bin"
+cat > "$REPO_PATH/build/native/gcc/bin/fdctl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$FDCTL_LOG"
+EOF
+chmod 755 "$REPO_PATH/build/native/gcc/bin/fdctl"
+exit 0
+"#,
+    );
+
+    let repo = temp.path().join("firedancer");
+    fs::create_dir_all(&repo).expect("repository directory");
+    write_executable(
+        &repo.join("deps.sh"),
+        "#!/bin/sh\nprintf '%s\n' \"$*\" >> \"$DEPS_LOG\"\n",
+    );
+
+    let config = temp.path().join("active-fd-config.toml");
+    fs::write(&config, "").expect("Firedancer config");
+
+    let deps_log = temp.path().join("deps.log");
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_val"))
+        .args([
+            "--base-path",
+            temp.path().to_str().expect("UTF-8 base path"),
+            "--repo-path",
+            repo.to_str().expect("UTF-8 repo path"),
+            "--config",
+            config.to_str().expect("UTF-8 config path"),
+            "--log-dir",
+            log_dir.to_str().expect("UTF-8 log path"),
+            "update-full",
+            "vTEST",
+        ])
+        .env("PATH", path)
+        .env("SYSTEMCTL_STATE", &state)
+        .env("SYSTEMCTL_LOG", &systemctl_log)
+        .env("FDCTL_LOG", &fdctl_log)
+        .env("GIT_LOG", &git_log)
+        .env("MAKE_LOG", &make_log)
+        .env("DEPS_LOG", &deps_log)
+        .env("REPO_PATH", repo.to_str().expect("UTF-8 repo path"))
+        .output()
+        .expect("run val update-full");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&state)
+            .expect("final service state")
+            .trim(),
+        "active"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[1/3] Update Firedancer (vTEST)"));
+    assert!(stdout.contains("[2/3] Build Firedancer"));
+    assert!(stdout.contains("[3/3] Restart service"));
+    assert!(stdout.contains("Update complete: vTEST"));
+    assert!(stdout.contains("Detailed log:"));
+
+    let systemctl = fs::read_to_string(&systemctl_log).expect("systemctl log");
+    let stop_at = first_line_with_word(&systemctl, "stop").expect("systemctl stop");
+    let start_at = first_line_with_word(&systemctl, "start").expect("systemctl start");
+    assert!(
+        stop_at < start_at,
+        "stop should run before start: {systemctl}"
+    );
+
+    let make = fs::read_to_string(&make_log).expect("make log");
+    assert!(make.contains("fdctl"), "{make}");
+
+    let deps = fs::read_to_string(&deps_log).expect("deps log");
+    assert!(deps.contains("fetch"), "{deps}");
+    assert!(deps.contains("install"), "{deps}");
 }

@@ -11,6 +11,7 @@ mod repository;
 mod restart;
 mod service;
 mod status;
+mod update_full;
 
 use std::{
     io::{self, Write},
@@ -52,7 +53,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let _log_guard = match logging::init(&paths.log_dir, cli.verbose) {
+    let compact_terminal = matches!(&cli.command, Commands::UpdateFull { .. }) && cli.verbose == 0;
+    let _log_guard = match logging::init(&paths.log_dir, cli.verbose, compact_terminal) {
         Ok(guard) => guard,
         Err(error) => {
             eprintln!("error: {error:#}");
@@ -90,6 +92,14 @@ fn dispatch(cli: &Cli, paths: &AppPaths) -> Result<()> {
         Commands::UpdateFiredancer { git_ref } => {
             repository::update_firedancer(&runner, &paths.repository, git_ref)
         }
+        Commands::UpdateFull { git_ref } => update_full::update_full(
+            &runner,
+            &service,
+            paths,
+            git_ref,
+            &cli.service,
+            cli.verbose == 0,
+        ),
         Commands::MakeFiredancer => {
             repository::make_firedancer(&runner, &paths.repository)?;
             Ok(())

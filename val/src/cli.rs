@@ -54,6 +54,13 @@ pub enum Commands {
         git_ref: String,
     },
 
+    /// Run update-firedancer, make-firedancer, then restart-firedancer.
+    UpdateFull {
+        /// Git tag, branch, or commit to check out.
+        #[arg(value_name = "GIT_REF")]
+        git_ref: String,
+    },
+
     /// Remove the Firedancer build directory, then build fdctl and solana.
     MakeFiredancer,
 
@@ -83,6 +90,7 @@ impl Commands {
         matches!(
             self,
             Self::UpdateFiredancer { .. }
+                | Self::UpdateFull { .. }
                 | Self::MakeFiredancer
                 | Self::ConfigureFiredancer
                 | Self::RestartFiredancer
@@ -93,6 +101,7 @@ impl Commands {
     pub fn name(&self) -> &'static str {
         match self {
             Self::UpdateFiredancer { .. } => "update-firedancer",
+            Self::UpdateFull { .. } => "update-full",
             Self::MakeFiredancer => "make-firedancer",
             Self::ConfigureFiredancer => "configure-firedancer",
             Self::StartFiredancer => "start-firedancer",

@@ -41,11 +41,16 @@ loaded by Bash automatically; operators do not run a separate setup command.
 Use a maintenance window for the full lifecycle:
 
 ```sh
-val stop-firedancer
+val update-full v0.708.30009
+val status
+```
+
+Or run the steps individually:
+
+```sh
 val update-firedancer v0.708.30009
 val make-firedancer
-val configure-firedancer
-val start-firedancer
+val restart-firedancer
 val status
 ```
 
@@ -54,6 +59,28 @@ To bounce an already-built validator without updating or rebuilding:
 ```sh
 val restart-firedancer
 ```
+
+### `update-full <GIT_REF>`
+
+Runs the full maintenance flow in one locked command:
+
+1. `update-firedancer` — fetch, check out the requested ref, reconcile submodules,
+   and install dependencies.
+2. `make-firedancer` — remove `build/`, then build `fdctl` and `solana`.
+3. `restart-firedancer` — stop the service, configure twice, start, and verify
+   the unit is active.
+
+The validator keeps running through checkout, dependency installation, and the
+clean build. The service is stopped only for the restart segment. Any update or
+build failure exits before touching systemd.
+
+By default, `update-full` prints compact stage progress on stdout and keeps
+detailed git, dependency, and make output in `val.log`. Pass `-v` to restore
+live command streams and diagnostic tracing on stderr.
+
+If the first configure pass fails, `val` logs a warning and continues to the
+second pass. Start runs only when the second pass succeeds. A failed second
+pass leaves the service stopped.
 
 ### `update-firedancer <GIT_REF>`
 
@@ -97,8 +124,10 @@ lines in `val.log`.
 
 Stops the systemd unit if it is running, runs `configure-firedancer` twice, then
 starts the unit. Configure is run twice because some Firedancer stages only
-finish after an earlier pass has applied. If any step fails, later steps are
-skipped and the service is left stopped. This is not a `systemctl restart`.
+finish after an earlier pass has applied. If the first configure pass fails,
+`val` logs a warning and continues to the second pass. Start runs only when the
+second pass succeeds; otherwise later steps are skipped and the service is left
+stopped. This is not a `systemctl restart`.
 
 ### `status`
 
