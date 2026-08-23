@@ -52,11 +52,18 @@ val status
 ### `update-firedancer <GIT_REF>`
 
 1. Verifies the checkout is a Git working tree.
-2. Refuses tracked, staged, or untracked local changes.
-3. Fetches tags and refs from `origin`.
-4. Resolves the requested ref to a commit and performs a detached checkout.
-5. Reconciles all submodules.
-6. Runs `deps.sh` interactively.
+2. Fetches tags and refs from `origin`.
+3. Resolves the requested ref to a commit.
+4. If the checkout or its submodules have leftover tracked or untracked
+   files, logs them and discards them. This path is a managed deployment
+   artifact: a previous `make-firedancer` commonly dirties the `agave`
+   submodule, and autonomous updates cannot stop for commit or stash.
+   Ignored outputs such as `build/` and `opt/` are kept. A missing ref
+   does not wipe the checkout. Submodule cleanup failures are logged and
+   the update continues so a forced submodule update can repair the tree.
+5. Performs a forced detached checkout of the resolved commit.
+6. Syncs submodule URLs and force-updates all submodules.
+7. Runs `deps.sh` interactively.
 
 The command is safe to repeat for the same ref. Dependency installation is
 still run on repeats so an interrupted first attempt can repair itself.

@@ -64,17 +64,6 @@ cd "$REPO_DIR" || { log "❌ ERROR: Failed to change directory to $REPO_DIR"; ex
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || { log "❌ ERROR: $REPO_DIR is not a git repository"; exit 1; }
 
-# Refuse to switch refs over tracked or untracked changes: a detached checkout
-# could otherwise abort with a cryptic error or leave files from another
-# version in the tree. Submodule state is ignored here — `git submodule
-# update` below reconciles it.
-if ! git diff --quiet --ignore-submodules \
-    || ! git diff --cached --quiet --ignore-submodules \
-    || [ -n "$(git ls-files --others --exclude-standard)" ]; then
-    log "❌ ERROR: working tree has changes; commit, stash (including untracked files), or remove them before updating"
-    exit 1
-fi
-
 # Fetch the latest refs and tags from origin only. (--all would contact every
 # configured remote and abort the whole update if an unrelated extra remote is
 # unreachable or auth-gated.)
@@ -88,16 +77,34 @@ if ! git rev-parse -q --verify "${REF}^{commit}" >/dev/null 2>&1; then
     exit 1
 fi
 
+# This checkout is a managed deployment artifact. A previous deps.sh or make
+# commonly leaves the agave submodule dirty, and autonomous updates cannot
+# stop for commit or stash. Discard leftover tracked/untracked files only after
+# the requested ref is known to exist. Keep ignored outputs such as build/ and
+# opt/. Submodule cleanup failures must not block the forced submodule update.
+STATUS="$(git status --porcelain=v1 --untracked-files=normal --ignore-submodules=none)"
+if [ -n "$STATUS" ]; then
+    log "⚠️ Discarding leftover Firedancer checkout changes before update:"
+    printf '%s\n' "$STATUS" | tee -a "$LOG_FILE"
+    git reset --hard HEAD 2>&1 | tee -a "$LOG_FILE"
+    git clean -ffd 2>&1 | tee -a "$LOG_FILE"
+    git submodule foreach --recursive git reset --hard 2>&1 | tee -a "$LOG_FILE" \
+        || log "⚠️ submodule reset failed; continuing with forced checkout"
+    git submodule foreach --recursive git clean -ffd 2>&1 | tee -a "$LOG_FILE" \
+        || log "⚠️ submodule clean failed; continuing with forced checkout"
+fi
+
 # Check out the ref in detached HEAD: avoids polluting the branch namespace and
 # the tag/branch name-collision ambiguity that a local branch named after a tag
 # would create on repeated runs.
 log "🌿 Checking out ref: $REF"
-git checkout --detach "$REF" 2>&1 | tee -a "$LOG_FILE"
+git checkout --force --detach "$REF" 2>&1 | tee -a "$LOG_FILE"
 
 log "✅ Now at: $(git describe --tags --always)"
 
 log "🔁 Updating submodules..."
-git submodule update --init --recursive 2>&1 | tee -a "$LOG_FILE"
+git submodule sync --recursive 2>&1 | tee -a "$LOG_FILE"
+git submodule update --init --recursive --force --checkout 2>&1 | tee -a "$LOG_FILE"
 log "✅ Submodules updated"
 
 # Run deps.sh attached to the terminal (NOT piped through tee) so its manual
