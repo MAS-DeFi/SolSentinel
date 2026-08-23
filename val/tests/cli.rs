@@ -363,12 +363,11 @@ esac
 printf '%s\n' "$*" >> "$GIT_LOG"
 case "$1" in
   rev-parse)
-    last="${@: -1}"
     if [ "$2" = "--is-inside-work-tree" ]; then
       printf 'true\n'
     elif [ "$2" = "--verify" ]; then
-      case "$last" in
-        HEAD)
+      case "$*" in
+        *HEAD)
           printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
           ;;
         *vTEST*)
