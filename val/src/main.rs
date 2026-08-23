@@ -105,8 +105,12 @@ fn dispatch(cli: &Cli, paths: &AppPaths) -> Result<()> {
             Ok(())
         }
         Commands::Status { json } => {
-            let report =
-                StatusReport::load(paths, service.state()?, service.running_fdctl_version()?)?;
+            let report = StatusReport::load(
+                paths,
+                service.state()?,
+                service.running_fdctl_version()?,
+                repository::built_fdctl_version(&runner, &paths.repository)?,
+            )?;
             let stdout = io::stdout();
             let mut output = stdout.lock();
             if *json {

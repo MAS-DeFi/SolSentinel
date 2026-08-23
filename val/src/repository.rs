@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::Path,
     time::{Duration, Instant},
 };
@@ -97,6 +98,32 @@ pub fn make_firedancer(runner: &dyn Runner, repository: &Path) -> Result<Duratio
         "Firedancer build completed"
     );
     Ok(duration)
+}
+
+/// Reads the version reported by the fdctl binary in the current checkout.
+pub fn built_fdctl_version(runner: &dyn Runner, repository: &Path) -> Result<Option<String>> {
+    let fdctl = executable_in(repository, "build/native/gcc/bin/fdctl");
+    let metadata = match fs::metadata(&fdctl) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not inspect built fdctl: {}", fdctl.display()));
+        }
+    };
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        bail!("built fdctl is not executable: {}", fdctl.display());
+    }
+
+    let outcome = require_success(
+        runner.capture(&CommandSpec::new(&fdctl).arg("version").cwd(repository))?,
+        "querying the built fdctl version",
+    )?;
+    let version = outcome.stdout.trim();
+    if version.is_empty() {
+        bail!("built fdctl returned an empty version");
+    }
+    Ok(Some(version.to_owned()))
 }
 
 /// Verifies that the configured path is a Git working tree.
@@ -197,22 +224,27 @@ fn validate_git_ref(git_ref: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, fs, sync::Mutex};
+    use std::{collections::VecDeque, fs, os::unix::fs::PermissionsExt, sync::Mutex};
 
     use anyhow::{Result, bail};
     use tempfile::TempDir;
 
-    use super::{resolve_git_ref, update_firedancer, validate_git_ref};
+    use super::{built_fdctl_version, resolve_git_ref, update_firedancer, validate_git_ref};
     use crate::process::{CommandOutcome, CommandSpec, Runner};
 
     struct FakeRunner {
         captures: Mutex<VecDeque<CommandOutcome>>,
+        capture_specs: Mutex<Vec<CommandSpec>>,
         streaming: Mutex<VecDeque<CommandOutcome>>,
         interactive: Mutex<VecDeque<CommandOutcome>>,
     }
 
     impl Runner for FakeRunner {
-        fn capture(&self, _: &CommandSpec) -> Result<CommandOutcome> {
+        fn capture(&self, spec: &CommandSpec) -> Result<CommandOutcome> {
+            self.capture_specs
+                .lock()
+                .expect("capture specs lock")
+                .push(spec.clone());
             self.captures
                 .lock()
                 .expect("capture lock")
@@ -252,6 +284,7 @@ mod tests {
                 CommandOutcome::success("true\n"),
                 CommandOutcome::success("?? local-file\n"),
             ])),
+            capture_specs: Mutex::new(Vec::new()),
             streaming: Mutex::new(VecDeque::new()),
             interactive: Mutex::new(VecDeque::new()),
         };
@@ -275,6 +308,7 @@ mod tests {
                 CommandOutcome::success(commit),
                 CommandOutcome::failure(128, "no HEAD"),
             ])),
+            capture_specs: Mutex::new(Vec::new()),
             streaming: Mutex::new(VecDeque::from([
                 CommandOutcome::success(""),
                 CommandOutcome::success(""),
@@ -300,6 +334,7 @@ mod tests {
                 CommandOutcome::failure(128, "tag not found"),
                 CommandOutcome::success(commit),
             ])),
+            capture_specs: Mutex::new(Vec::new()),
             streaming: Mutex::new(VecDeque::new()),
             interactive: Mutex::new(VecDeque::new()),
         };
@@ -308,6 +343,35 @@ mod tests {
             resolve_git_ref(&runner, repository.path(), "main")?,
             commit.trim()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reads_version_from_the_built_fdctl() -> Result<()> {
+        let repository = TempDir::new()?;
+        let fdctl = repository.path().join("build/native/gcc/bin/fdctl");
+        fs::create_dir_all(fdctl.parent().expect("fdctl parent"))?;
+        fs::write(&fdctl, "")?;
+        let mut permissions = fs::metadata(&fdctl)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fdctl, permissions)?;
+
+        let runner = FakeRunner {
+            captures: Mutex::new(VecDeque::from([CommandOutcome::success("v2.0.0\n")])),
+            capture_specs: Mutex::new(Vec::new()),
+            streaming: Mutex::new(VecDeque::new()),
+            interactive: Mutex::new(VecDeque::new()),
+        };
+
+        assert_eq!(
+            built_fdctl_version(&runner, repository.path())?.as_deref(),
+            Some("v2.0.0")
+        );
+        let captures = runner.capture_specs.lock().expect("capture specs lock");
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].program, fdctl.as_os_str());
+        assert_eq!(captures[0].args, ["version"]);
+        assert_eq!(captures[0].cwd.as_deref(), Some(repository.path()));
         Ok(())
     }
 }

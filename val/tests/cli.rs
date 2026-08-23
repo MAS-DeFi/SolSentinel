@@ -136,6 +136,15 @@ fn status_json_runs_end_to_end() {
     permissions.set_mode(0o755);
     fs::set_permissions(&systemctl, permissions).expect("systemctl permissions");
 
+    let fdctl = temp
+        .path()
+        .join("code/firedancer/build/native/gcc/bin/fdctl");
+    fs::create_dir_all(fdctl.parent().expect("fdctl parent")).expect("fdctl directory");
+    fs::write(&fdctl, "#!/bin/sh\nprintf 'v2.0.0\\n'\n").expect("fake fdctl");
+    let mut permissions = fs::metadata(&fdctl).expect("fdctl metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fdctl, permissions).expect("fdctl permissions");
+
     let identity = temp.path().join("active-id.json");
     let secret = [9_u8; 32];
     let public = SigningKey::from_bytes(&secret).verifying_key().to_bytes();
@@ -185,6 +194,7 @@ fn status_json_runs_end_to_end() {
     let status: Value = serde_json::from_slice(&output.stdout).expect("status JSON");
     assert_eq!(status["service"], "active");
     assert!(status["running_fdctl_version"].is_null());
+    assert_eq!(status["built_fdctl_version"], "v2.0.0");
     assert_eq!(status["active_id_key"], bs58::encode(public).into_string());
     assert_eq!(status["snapshot_fetch"], true);
 

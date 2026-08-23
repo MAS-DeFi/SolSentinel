@@ -85,6 +85,7 @@ Prints:
 
 - systemd service state
 - the running service's `fdctl version` (read through `sudo /proc/<pid>/exe`)
+- the current checkout's built `fdctl version`, even when the service is stopped
 - the active identity **public** key
 - identity keypair path
 - whether `[consensus].snapshot_fetch` is enabled
