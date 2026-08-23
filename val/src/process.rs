@@ -12,6 +12,8 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 
+use crate::progress::LiveProgressPause;
+
 pub const COMMAND_OUTPUT_TARGET: &str = "val::command_output";
 
 static COMPACT_OUTPUT: AtomicBool = AtomicBool::new(false);
@@ -226,6 +228,7 @@ impl Runner for SystemRunner {
     /// Runs a command attached to the current terminal.
     fn interactive(&self, spec: &CommandSpec) -> Result<CommandOutcome> {
         info!(command = %spec.display(), "starting interactive command");
+        let _pause = LiveProgressPause::new();
         let status = configured_command(spec)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())

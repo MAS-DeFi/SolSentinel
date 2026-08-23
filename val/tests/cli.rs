@@ -462,8 +462,18 @@ exit 0
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stdout.contains("[1/3] Update Firedancer (vTEST)"));
+    assert!(stdout.contains("checkout and dependencies"));
+    assert!(stdout.contains("in progress"));
     assert!(stdout.contains("[2/3] Build Firedancer"));
     assert!(stdout.contains("[3/3] Restart service"));
+    assert!(
+        stdout.matches("in progress").count() >= 3,
+        "each compact stage should report in progress\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("done"),
+        "compact stages should finish with done\nstdout: {stdout}"
+    );
     assert!(stdout.contains("Update complete: vTEST"));
     assert!(stdout.contains("Detailed log:"));
     assert!(

@@ -75,8 +75,11 @@ clean build. The service is stopped only for the restart segment. Any update or
 build failure exits before touching systemd.
 
 By default, `update-full` prints compact stage progress on stdout and keeps
-detailed git, dependency, and make output in `val.log`. Pass `-v` to restore
-live command streams and diagnostic tracing on stderr.
+detailed git, dependency, and make output in `val.log`. On an interactive
+terminal, the current stage shows a spinner and elapsed time so a long
+checkout, dependency install, or build does not look stalled. When stdout is
+piped, each stage prints `in progress` immediately and `done` when it finishes.
+Pass `-v` to restore live command streams and diagnostic tracing on stderr.
 
 If the first configure pass fails, `val` logs a warning and continues to the
 second pass. Start runs only when the second pass succeeds. A failed second

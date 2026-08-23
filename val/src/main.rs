@@ -7,6 +7,7 @@ mod logging;
 mod paths;
 mod privilege;
 mod process;
+mod progress;
 mod repository;
 mod restart;
 mod service;

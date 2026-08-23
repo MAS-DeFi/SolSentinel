@@ -12,6 +12,7 @@ use anyhow::Result;
 use crate::{
     paths::AppPaths,
     process::{CompactOutputGuard, Runner},
+    progress::{StageProgress, format_duration},
     repository,
     restart::{RestartPhase, RestartReporter, restart_firedancer_with_reporter},
     service::{ServiceManager, ServiceState},
@@ -40,7 +41,7 @@ fn run_update_full(
 ) -> Result<()> {
     let started = Instant::now();
     let log_path = paths.log_dir.join("val.log");
-    let progress = ProgressReporter::new(compact, git_ref, service_name, &log_path);
+    let mut progress = ProgressReporter::new(compact, git_ref, service_name, &log_path);
 
     progress.begin();
 
@@ -50,6 +51,7 @@ fn run_update_full(
     }
     progress.finish_update();
 
+    progress.begin_build();
     let build_duration = match repository::make_firedancer(runner, &paths.repository) {
         Ok(duration) => {
             progress.finish_build(duration);
@@ -62,9 +64,7 @@ fn run_update_full(
     };
 
     let restart_progress = RefCell::new(RestartProgress::new(compact));
-    if compact {
-        let _ = writeln!(io::stdout(), "[3/3] Restart service");
-    }
+    progress.begin_restart();
 
     if let Err(error) = restart_firedancer_with_reporter(
         runner,
@@ -118,6 +118,7 @@ struct ProgressReporter<'a> {
     git_ref: &'a str,
     service: &'a str,
     log_path: &'a Path,
+    current: Option<StageProgress>,
 }
 
 impl<'a> ProgressReporter<'a> {
@@ -127,64 +128,92 @@ impl<'a> ProgressReporter<'a> {
             git_ref,
             service,
             log_path,
+            current: None,
         }
     }
 
-    fn begin(&self) {
+    fn begin(&mut self) {
         if self.compact {
-            let _ = writeln!(io::stdout(), "[1/3] Update Firedancer ({})", self.git_ref);
+            emit_line(&format!("[1/3] Update Firedancer ({})", self.git_ref));
+            self.current = Some(StageProgress::start(
+                true,
+                "      checkout and dependencies",
+            ));
         }
     }
 
-    fn finish_update(&self) {
+    fn finish_update(&mut self) {
+        self.finish_current("done");
+    }
+
+    fn begin_build(&mut self) {
+        debug_assert!(self.current.is_none());
         if self.compact {
-            let _ = writeln!(io::stdout(), "      checkout and dependencies ... done");
+            self.current = Some(StageProgress::start(true, "[2/3] Build Firedancer"));
         }
     }
 
-    fn finish_build(&self, duration: Duration) {
+    fn finish_build(&mut self, duration: Duration) {
+        self.finish_current(&format!("done ({})", format_duration(duration)));
+    }
+
+    fn begin_restart(&mut self) {
+        debug_assert!(self.current.is_none());
         if self.compact {
-            let _ = writeln!(
-                io::stdout(),
-                "[2/3] Build Firedancer ................... done ({})",
-                format_duration(duration)
-            );
+            self.current = Some(StageProgress::start(true, "[3/3] Restart service"));
         }
     }
 
-    fn finish_success(&self, total: Duration, build_duration: Duration, restart: RestartProgress) {
+    fn finish_success(
+        &mut self,
+        total: Duration,
+        build_duration: Duration,
+        restart: RestartProgress,
+    ) {
+        self.finish_current("done");
         if !self.compact {
             return;
         }
 
         restart.write_lines(io::stdout()).ok();
-        let _ = writeln!(io::stdout());
-        let _ = writeln!(io::stdout(), "Update complete: {}", self.git_ref);
-        let _ = writeln!(
-            io::stdout(),
+        emit_line("");
+        emit_line(&format!("Update complete: {}", self.git_ref));
+        emit_line(&format!(
             "Service: {} ({})",
-            self.service,
-            restart.final_state
-        );
-        let _ = writeln!(
-            io::stdout(),
+            self.service, restart.final_state
+        ));
+        emit_line(&format!(
             "Build: {} | Total: {}",
             format_duration(build_duration),
             format_duration(total)
-        );
-        let _ = writeln!(io::stdout(), "Detailed log: {}", self.log_path.display());
+        ));
+        emit_line(&format!("Detailed log: {}", self.log_path.display()));
     }
 
-    fn fail_update(&self, error: &anyhow::Error, impact: ServiceImpact) {
+    fn fail_update(&mut self, error: &anyhow::Error, impact: ServiceImpact) {
+        self.finish_current("failed");
         self.fail("update", error, impact, None);
     }
 
-    fn fail_build(&self, error: &anyhow::Error, impact: ServiceImpact) {
+    fn fail_build(&mut self, error: &anyhow::Error, impact: ServiceImpact) {
+        self.finish_current("failed");
         self.fail("build", error, impact, None);
     }
 
-    fn fail_restart(&self, error: &anyhow::Error, impact: ServiceImpact, restart: RestartProgress) {
+    fn fail_restart(
+        &mut self,
+        error: &anyhow::Error,
+        impact: ServiceImpact,
+        restart: RestartProgress,
+    ) {
+        self.finish_current("failed");
         self.fail("restart", error, impact, Some(restart));
+    }
+
+    fn finish_current(&mut self, status: &str) {
+        if let Some(stage) = self.current.take() {
+            stage.finish(status);
+        }
     }
 
     fn fail(
@@ -198,29 +227,33 @@ impl<'a> ProgressReporter<'a> {
             return;
         }
 
-        let _ = writeln!(io::stdout());
-        let _ = writeln!(io::stdout(), "Update failed during {stage}.");
-        let _ = writeln!(io::stdout(), "Error: {error:#}");
+        emit_line("");
+        emit_line(&format!("Update failed during {stage}."));
+        emit_line(&format!("Error: {error:#}"));
         if let Some(restart) = restart {
             restart.write_lines(io::stdout()).ok();
         }
         match impact {
             ServiceImpact::Unchanged => {
-                let _ = writeln!(io::stdout(), "Service was not stopped.");
+                emit_line("Service was not stopped.");
             }
             ServiceImpact::Stopped => {
-                let _ = writeln!(io::stdout(), "Service remains stopped ({}).", self.service);
+                emit_line(&format!("Service remains stopped ({}).", self.service));
             }
             ServiceImpact::FailedToRestart => {
-                let _ = writeln!(
-                    io::stdout(),
+                emit_line(&format!(
                     "Service did not become active ({}).",
                     self.service
-                );
+                ));
             }
         }
-        let _ = writeln!(io::stdout(), "Detailed log: {}", self.log_path.display());
+        emit_line(&format!("Detailed log: {}", self.log_path.display()));
     }
+}
+
+fn emit_line(line: &str) {
+    let _ = writeln!(io::stdout(), "{line}");
+    let _ = io::stdout().flush();
 }
 
 struct RestartProgressReporter<'a> {
@@ -362,22 +395,10 @@ impl RestartProgress {
     }
 }
 
-fn format_duration(duration: Duration) -> String {
-    let total_seconds = duration.as_secs();
-    let minutes = total_seconds / 60;
-    let seconds = total_seconds % 60;
-    if minutes == 0 {
-        format!("{seconds}s")
-    } else {
-        format!("{minutes}m {seconds}s")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         collections::VecDeque, fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Mutex,
-        time::Duration,
     };
 
     use anyhow::{Result, anyhow};
@@ -637,11 +658,5 @@ mod tests {
         let lines = String::from_utf8(output)?;
         assert!(lines.contains("configure 2/2 ........................ failed"));
         Ok(())
-    }
-
-    #[test]
-    fn format_duration_renders_minutes_and_seconds() {
-        assert_eq!(super::format_duration(Duration::from_secs(28)), "28s");
-        assert_eq!(super::format_duration(Duration::from_secs(208)), "3m 28s");
     }
 }
