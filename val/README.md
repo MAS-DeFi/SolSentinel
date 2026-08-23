@@ -20,7 +20,7 @@ All paths and the unit name can be overridden with global CLI options.
 - Rust 1.89 or newer to build
 - An existing Firedancer checkout and active config
 
-Run update, build, and configure as the validator user. If invoked through
+Run update, build, configure, and restart as the validator user. If invoked through
 `sudo`, `val` re-executes itself as `SUDO_USER` before opening logs or touching
 the checkout. A direct root login is rejected for these commands to prevent
 root-owned build artifacts.
@@ -47,6 +47,12 @@ val make-firedancer
 val configure-firedancer
 val start-firedancer
 val status
+```
+
+To bounce an already-built validator without updating or rebuilding:
+
+```sh
+val restart-firedancer
 ```
 
 ### `update-firedancer <GIT_REF>`
@@ -86,6 +92,13 @@ Checks the systemd unit before taking action. Starting an active service and
 stopping an inactive service are successful no-ops. After a state change, the
 command verifies the final state. Start failures include the latest 20 journal
 lines in `val.log`.
+
+### `restart-firedancer`
+
+Stops the systemd unit if it is running, runs `configure-firedancer` twice, then
+starts the unit. Configure is run twice because some Firedancer stages only
+finish after an earlier pass has applied. If any step fails, later steps are
+skipped and the service is left stopped. This is not a `systemctl restart`.
 
 ### `status`
 

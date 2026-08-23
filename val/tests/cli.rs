@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::{env, fs, os::unix::fs::PermissionsExt, process::Command};
+use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 use clap::CommandFactory;
 use clap_complete::{generate, shells::Bash};
@@ -93,6 +93,7 @@ fn lifecycle_commands_use_hyphens_only() {
         ("configure-firedancer", "configure_firedancer"),
         ("start-firedancer", "start_firedancer"),
         ("stop-firedancer", "stop_firedancer"),
+        ("restart-firedancer", "restart_firedancer"),
     ];
 
     for (canonical, removed) in commands {
@@ -200,4 +201,112 @@ fn status_json_runs_end_to_end() {
 
     let log = fs::read_to_string(log_dir.join("val.log")).expect("val log");
     assert!(log.contains("val command completed"));
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("parent directory");
+    }
+    fs::write(path, contents).expect("write executable");
+    let mut permissions = fs::metadata(path)
+        .expect("executable metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("executable permissions");
+}
+
+fn first_line_with_word(log: &str, word: &str) -> Option<usize> {
+    log.lines()
+        .position(|line| line.split_whitespace().any(|token| token == word))
+}
+
+#[test]
+fn restart_runs_stop_configure_configure_start() {
+    let temp = TempDir::new().expect("temporary directory");
+    let bin_dir = temp.path().join("bin");
+    let log_dir = temp.path().join("logs");
+    let state = temp.path().join("service-state");
+    let systemctl_log = temp.path().join("systemctl.log");
+    let fdctl_log = temp.path().join("fdctl.log");
+    fs::write(&state, "active\n").expect("initial service state");
+
+    write_executable(
+        &bin_dir.join("sudo"),
+        "#!/bin/sh\n[ \"$1\" = -- ] && shift\nexec \"$@\"\n",
+    );
+    write_executable(
+        &bin_dir.join("systemctl"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+case " $* " in
+  *" show "*) printf 'LoadState=loaded\nActiveState=%s\n' "$(cat "$SYSTEMCTL_STATE")" ;;
+  *" stop "*) printf 'inactive\n' > "$SYSTEMCTL_STATE" ;;
+  *" start "*) printf 'active\n' > "$SYSTEMCTL_STATE" ;;
+  *) echo unexpected: "$*" >&2; exit 1 ;;
+esac
+"#,
+    );
+
+    let repo = temp.path().join("firedancer");
+    let fdctl = repo.join("build/native/gcc/bin/fdctl");
+    write_executable(
+        &fdctl,
+        "#!/bin/sh\nprintf '%s\n' \"$*\" >> \"$FDCTL_LOG\"\n",
+    );
+
+    let config = temp.path().join("active-fd-config.toml");
+    fs::write(&config, "").expect("Firedancer config");
+
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_val"))
+        .args([
+            "--base-path",
+            temp.path().to_str().expect("UTF-8 base path"),
+            "--repo-path",
+            repo.to_str().expect("UTF-8 repo path"),
+            "--config",
+            config.to_str().expect("UTF-8 config path"),
+            "--log-dir",
+            log_dir.to_str().expect("UTF-8 log path"),
+            "restart-firedancer",
+        ])
+        .env("PATH", path)
+        .env("SYSTEMCTL_STATE", &state)
+        .env("SYSTEMCTL_LOG", &systemctl_log)
+        .env("FDCTL_LOG", &fdctl_log)
+        .output()
+        .expect("run val restart-firedancer");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&state)
+            .expect("final service state")
+            .trim(),
+        "active"
+    );
+    let systemctl = fs::read_to_string(&systemctl_log).expect("systemctl log");
+    let stop_at = first_line_with_word(&systemctl, "stop").expect("systemctl stop");
+    let start_at = first_line_with_word(&systemctl, "start").expect("systemctl start");
+    assert!(
+        stop_at < start_at,
+        "stop should run before start: {systemctl}"
+    );
+    let fdctl_invocations = fs::read_to_string(&fdctl_log).expect("fdctl log");
+    let configure_runs = fdctl_invocations
+        .lines()
+        .filter(|line| line.contains("configure init all"))
+        .count();
+    assert_eq!(configure_runs, 2, "{fdctl_invocations}");
+    assert!(
+        fdctl_invocations.contains(config.to_str().expect("UTF-8 config path")),
+        "{fdctl_invocations}"
+    );
 }

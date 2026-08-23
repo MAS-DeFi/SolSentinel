@@ -119,6 +119,12 @@ val start-firedancer
 val status
 ```
 
+To bounce an already-built validator without updating or rebuilding:
+
+```sh
+val restart-firedancer
+```
+
 See [`val/README.md`](val/README.md) for build, installation, configuration,
 logging, and command behavior.
 

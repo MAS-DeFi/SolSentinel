@@ -8,6 +8,7 @@ mod paths;
 mod privilege;
 mod process;
 mod repository;
+mod restart;
 mod service;
 mod status;
 
@@ -103,6 +104,9 @@ fn dispatch(cli: &Cli, paths: &AppPaths) -> Result<()> {
         Commands::StopFiredancer => {
             service.stop()?;
             Ok(())
+        }
+        Commands::RestartFiredancer => {
+            restart::restart_firedancer(&runner, &service, &paths.repository, &paths.config)
         }
         Commands::Status { json } => {
             let report = StatusReport::load(

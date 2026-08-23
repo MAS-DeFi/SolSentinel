@@ -28,7 +28,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub log_dir: Option<PathBuf>,
 
-    /// systemd service managed by start, stop, and status.
+    /// systemd service managed by start, stop, restart, and status.
     #[arg(
         long,
         global = true,
@@ -66,6 +66,9 @@ pub enum Commands {
     /// Stop the Firedancer systemd service, if it is not already inactive.
     StopFiredancer,
 
+    /// Stop the service, run configure-firedancer twice, then start it.
+    RestartFiredancer,
+
     /// Show service state, active identity public key, and snapshot-fetch state.
     Status {
         /// Emit machine-readable JSON.
@@ -79,7 +82,10 @@ impl Commands {
     pub fn requires_validator_user(&self) -> bool {
         matches!(
             self,
-            Self::UpdateFiredancer { .. } | Self::MakeFiredancer | Self::ConfigureFiredancer
+            Self::UpdateFiredancer { .. }
+                | Self::MakeFiredancer
+                | Self::ConfigureFiredancer
+                | Self::RestartFiredancer
         )
     }
 
@@ -91,6 +97,7 @@ impl Commands {
             Self::ConfigureFiredancer => "configure-firedancer",
             Self::StartFiredancer => "start-firedancer",
             Self::StopFiredancer => "stop-firedancer",
+            Self::RestartFiredancer => "restart-firedancer",
             Self::Status { .. } => "status",
         }
     }
