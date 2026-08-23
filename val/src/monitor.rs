@@ -1,9 +1,8 @@
 //! Debug watcher for the Firedancer GUI websocket.
 
 use std::{
-    collections::BTreeSet,
     fs,
-    io::{self, ErrorKind, Write},
+    io::{self, ErrorKind, IsTerminal, Write},
     path::Path,
     thread,
     time::{Duration, Instant},
@@ -13,11 +12,12 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
-use tungstenite::{Message, connect};
+use tungstenite::{Message, connect, stream::MaybeTlsStream};
 
 const DEFAULT_GUI_ADDRESS: &str = "127.0.0.1";
 const DEFAULT_GUI_PORT: u16 = 80;
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const STATE_COLUMN: usize = 42;
 
 /// Connects to the Firedancer GUI websocket and prints boot/startup state.
 pub fn run(config_path: &Path, url_override: Option<&str>, all: bool) -> Result<()> {
@@ -26,7 +26,9 @@ pub fn run(config_path: &Path, url_override: Option<&str>, all: bool) -> Result<
         None => websocket_url_from_config(config_path)?,
     };
     info!(url = %url, all, "connecting to Firedancer GUI websocket");
-    watch(&url, all, &mut io::stdout().lock())
+    let stdout = io::stdout();
+    let live = stdout.is_terminal() && !all;
+    watch(&url, all, live, &mut stdout.lock())
 }
 
 /// Reads the GUI listen address from a Firedancer TOML config.
@@ -115,13 +117,14 @@ fn websocket_url(address: &str, port: u16) -> String {
     format!("ws://{host}:{port}/websocket")
 }
 
-fn watch(url: &str, all: bool, out: &mut impl Write) -> Result<()> {
-    watch_with_retry(url, all, out, RETRY_INTERVAL, None)
+fn watch(url: &str, all: bool, live: bool, out: &mut impl Write) -> Result<()> {
+    watch_with_retry(url, all, live, out, RETRY_INTERVAL, None)
 }
 
 fn watch_with_retry(
     url: &str,
     all: bool,
+    live: bool,
     out: &mut impl Write,
     retry_interval: Duration,
     max_sessions: Option<usize>,
@@ -129,40 +132,39 @@ fn watch_with_retry(
     let started = Instant::now();
     if all {
         writeln!(out, "dumping every websocket message; Ctrl+C to stop")?;
-    } else {
-        writeln!(
-            out,
-            "showing startup/boot progress; other keys listed once. Pass --all to dump every message. Ctrl+C to stop"
-        )?;
+        out.flush().context("could not write monitor output")?;
     }
-    out.flush().context("could not write monitor output")?;
 
     let mut unavailable = false;
+    let mut state = CurrentState::new(live);
     let mut sessions = 0;
     loop {
-        match watch_session(url, all, started, &mut unavailable, out) {
+        match watch_session(url, all, started, &mut unavailable, &mut state, out) {
             Ok(()) => {
                 sessions += 1;
                 if max_sessions.is_some_and(|max| sessions >= max) {
                     return Ok(());
                 }
-                announce_unavailable(started, &mut unavailable, out)?;
+                announce_unavailable(all, started, &mut unavailable, &mut state, out)?;
             }
             Err(error) if is_unavailable(&error) => {
-                announce_unavailable(started, &mut unavailable, out)?;
+                announce_unavailable(all, started, &mut unavailable, &mut state, out)?;
             }
             Err(error) => return Err(error),
         }
         thread::sleep(retry_interval);
+        state.tick(out)?;
     }
 }
 
 fn announce_unavailable(
+    all: bool,
     started: Instant,
     unavailable: &mut bool,
+    state: &mut CurrentState,
     out: &mut impl Write,
 ) -> Result<()> {
-    if !*unavailable {
+    if all && !*unavailable {
         writeln!(
             out,
             "+{:.1}s  service not available; retrying",
@@ -170,6 +172,8 @@ fn announce_unavailable(
         )?;
         out.flush().context("could not write monitor output")?;
         *unavailable = true;
+    } else if !all {
+        state.transition("service not available; retrying", out)?;
     }
     Ok(())
 }
@@ -179,30 +183,46 @@ fn watch_session(
     all: bool,
     started: Instant,
     unavailable: &mut bool,
+    state: &mut CurrentState,
     out: &mut impl Write,
 ) -> Result<()> {
     let (mut socket, _response) =
         connect(url).with_context(|| format!("could not connect to Firedancer GUI at {url}"))?;
     *unavailable = false;
-    writeln!(out, "+{:.1}s  connected  {url}", elapsed_secs(started))?;
-    out.flush().context("could not write monitor output")?;
+    if all {
+        writeln!(out, "+{:.1}s  connected  {url}", elapsed_secs(started))?;
+        out.flush().context("could not write monitor output")?;
+    } else {
+        state.transition("connected; waiting for validator state", out)?;
+    }
+    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        stream
+            .set_read_timeout(Some(RETRY_INTERVAL))
+            .context("could not configure monitor refresh interval")?;
+    }
 
-    let mut hidden_keys = BTreeSet::new();
     loop {
         match socket.read() {
             Ok(Message::Text(payload)) => {
-                handle_text(payload.as_str(), all, started, &mut hidden_keys, out)?;
+                handle_text(payload.as_str(), all, started, state, out)?;
             }
             Ok(Message::Binary(_)) => {
-                writeln!(
-                    out,
-                    "+{:.1}s  <binary websocket frame ignored>",
-                    elapsed_secs(started)
-                )?;
-                out.flush().context("could not write monitor output")?;
+                if all {
+                    writeln!(
+                        out,
+                        "+{:.1}s  <binary websocket frame ignored>",
+                        elapsed_secs(started)
+                    )?;
+                    out.flush().context("could not write monitor output")?;
+                }
             }
-            Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
+            Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {
+                state.tick(out)?;
+            }
             Ok(Message::Close(_)) => return Ok(()),
+            Err(tungstenite::Error::Io(error)) if is_refresh_timeout(&error) => {
+                state.tick(out)?;
+            }
             Err(error) if is_unavailable_websocket(&error) => return Ok(()),
             Err(error) => {
                 return Err(error)
@@ -216,7 +236,7 @@ fn handle_text(
     payload: &str,
     all: bool,
     started: Instant,
-    hidden_keys: &mut BTreeSet<String>,
+    state: &mut CurrentState,
     out: &mut impl Write,
 ) -> Result<()> {
     let elapsed = elapsed_secs(started);
@@ -224,12 +244,14 @@ fn handle_text(
         if all {
             writeln!(out, "+{elapsed:.1}s  <unparsed>\n{payload}")?;
             out.flush().context("could not write monitor output")?;
+        } else {
+            state.tick(out)?;
         }
         return Ok(());
     };
 
     let name = format!("{}.{}", message.topic, message.key);
-    if all || is_progress_key(&message.topic, &message.key) {
+    if all {
         writeln!(out, "+{elapsed:.1}s  {name}")?;
         writeln!(
             out,
@@ -237,11 +259,105 @@ fn handle_text(
             serde_json::to_string_pretty(&message.value)
                 .unwrap_or_else(|_| message.value.to_string())
         )?;
-    } else if hidden_keys.insert(name.clone()) {
-        writeln!(out, "+{elapsed:.1}s  {name}  [hidden; pass --all to print]")?;
+        out.flush().context("could not write monitor output")?;
+    } else if is_progress_key(&message.topic, &message.key)
+        && let Some(phase) = message.value.get("phase").and_then(Value::as_str)
+    {
+        state.transition(&humanize_phase(phase), out)?;
+    } else {
+        state.tick(out)?;
     }
-    out.flush().context("could not write monitor output")?;
     Ok(())
+}
+
+#[derive(Debug)]
+struct CurrentState {
+    active: Option<ActiveState>,
+    live: bool,
+}
+
+#[derive(Debug)]
+struct ActiveState {
+    label: String,
+    started: Instant,
+    rendered_second: u64,
+}
+
+impl CurrentState {
+    fn new(live: bool) -> Self {
+        Self { active: None, live }
+    }
+
+    fn transition(&mut self, label: &str, out: &mut impl Write) -> Result<()> {
+        self.transition_at(label, Instant::now(), out)
+    }
+
+    fn transition_at(&mut self, label: &str, now: Instant, out: &mut impl Write) -> Result<()> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|state| state.label == label)
+        {
+            return self.tick_at(now, out);
+        }
+
+        if self.live && self.active.is_some() {
+            self.render_at(now, out)?;
+            writeln!(out)?;
+        }
+
+        self.active = Some(ActiveState {
+            label: label.to_owned(),
+            started: now,
+            rendered_second: 0,
+        });
+        if self.live {
+            self.render_at(now, out)?;
+        } else {
+            writeln!(out, "{}", state_line(label, Duration::ZERO))?;
+            out.flush().context("could not write monitor output")?;
+        }
+        Ok(())
+    }
+
+    fn tick(&mut self, out: &mut impl Write) -> Result<()> {
+        self.tick_at(Instant::now(), out)
+    }
+
+    fn tick_at(&mut self, now: Instant, out: &mut impl Write) -> Result<()> {
+        let Some(active) = self.active.as_ref() else {
+            return Ok(());
+        };
+        if !self.live || now.duration_since(active.started).as_secs() == active.rendered_second {
+            return Ok(());
+        }
+        self.render_at(now, out)
+    }
+
+    fn render_at(&mut self, now: Instant, out: &mut impl Write) -> Result<()> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(());
+        };
+        let elapsed = now.duration_since(active.started);
+        active.rendered_second = elapsed.as_secs();
+        write!(out, "\r{}\x1b[K", state_line(&active.label, elapsed))?;
+        out.flush().context("could not write monitor output")
+    }
+}
+
+fn humanize_phase(phase: &str) -> String {
+    phase.replace('_', " ")
+}
+
+fn state_line(label: &str, elapsed: Duration) -> String {
+    let dots = STATE_COLUMN
+        .saturating_sub(label.len().saturating_add(1))
+        .max(3);
+    format!(
+        "{label} {} {}",
+        ".".repeat(dots),
+        crate::progress::format_duration(elapsed)
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,6 +414,10 @@ fn is_unavailable_io(error: &io::Error) -> bool {
     )
 }
 
+fn is_refresh_timeout(error: &io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -311,7 +431,7 @@ mod tests {
     use tungstenite::{Message, accept};
 
     use super::{
-        GuiEndpoint, connect_address, is_progress_key, is_unavailable, watch_session,
+        CurrentState, GuiEndpoint, connect_address, is_progress_key, is_unavailable, watch_session,
         watch_with_retry, websocket_url,
     };
 
@@ -395,16 +515,14 @@ mod tests {
     #[test]
     fn tungstenite_unable_to_connect_is_unavailable() {
         let error = anyhow::Error::from(tungstenite::Error::Url(
-            tungstenite::error::UrlError::UnableToConnect(
-                "ws://127.0.0.1:80/websocket".to_owned(),
-            ),
+            tungstenite::error::UrlError::UnableToConnect("ws://127.0.0.1:80/websocket".to_owned()),
         ))
         .context("could not connect to Firedancer GUI at ws://127.0.0.1:80/websocket");
         assert!(is_unavailable(&error), "{error:#}");
     }
 
     #[test]
-    fn prints_startup_progress_and_hides_other_keys() -> Result<()> {
+    fn prints_only_validator_state_transitions() -> Result<()> {
         let server = TcpListener::bind("127.0.0.1:0")?;
         let addr = server.local_addr()?;
         let url = format!("ws://{addr}/websocket");
@@ -432,23 +550,25 @@ mod tests {
 
         let mut output = Vec::new();
         let mut unavailable = false;
-        watch_session(&url, false, Instant::now(), &mut unavailable, &mut output)?;
+        let mut state = CurrentState::new(false);
+        watch_session(
+            &url,
+            false,
+            Instant::now(),
+            &mut unavailable,
+            &mut state,
+            &mut output,
+        )?;
         thread.join().expect("server thread");
 
         let text = String::from_utf8(output)?;
-        assert!(text.contains("connected"), "{text}");
         assert!(
-            text.contains("summary.cluster  [hidden; pass --all to print]"),
+            text.contains("connected; waiting for validator state"),
             "{text}"
         );
-        assert!(text.contains("summary.startup_progress"), "{text}");
-        assert!(text.contains("downloading_full_snapshot"), "{text}");
-        assert_eq!(
-            text.matches("summary.cluster  [hidden; pass --all to print]")
-                .count(),
-            1,
-            "{text}"
-        );
+        assert!(text.contains("downloading full snapshot"), "{text}");
+        assert!(!text.contains("summary.cluster"), "{text}");
+        assert!(!text.contains("current_bytes"), "{text}");
         Ok(())
     }
 
@@ -464,7 +584,15 @@ mod tests {
 
         let mut output = Vec::new();
         let mut unavailable = false;
-        watch_session(&url, true, Instant::now(), &mut unavailable, &mut output)?;
+        let mut state = CurrentState::new(false);
+        watch_session(
+            &url,
+            true,
+            Instant::now(),
+            &mut unavailable,
+            &mut state,
+            &mut output,
+        )?;
 
         let text = String::from_utf8(output)?;
         assert!(text.contains("summary.cluster"), "{text}");
@@ -493,14 +621,44 @@ mod tests {
         });
 
         let mut output = Vec::new();
-        watch_with_retry(&url, false, &mut output, Duration::from_millis(20), Some(2))?;
+        watch_with_retry(
+            &url,
+            false,
+            false,
+            &mut output,
+            Duration::from_millis(20),
+            Some(2),
+        )?;
         thread.join().expect("server thread");
 
         let text = String::from_utf8(output)?;
         assert_eq!(text.matches("connected").count(), 2, "{text}");
         assert!(text.contains("service not available; retrying"), "{text}");
-        assert!(text.contains("downloading_full_snapshot"), "{text}");
-        assert!(text.contains("\"phase\": \"running\""), "{text}");
+        assert!(text.contains("downloading full snapshot"), "{text}");
+        assert!(text.contains("running"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn live_state_counts_up_and_starts_a_new_line_on_transition() -> Result<()> {
+        let started = Instant::now();
+        let mut state = CurrentState::new(true);
+        let mut output = Vec::new();
+
+        state.transition_at("loading ledger", started, &mut output)?;
+        state.tick_at(started + Duration::from_secs(3), &mut output)?;
+        state.transition_at(
+            "processing ledger",
+            started + Duration::from_secs(5),
+            &mut output,
+        )?;
+
+        let text = String::from_utf8(output)?;
+        assert!(text.contains("loading ledger"), "{text}");
+        assert!(text.contains("3s"), "{text}");
+        assert!(text.contains("5s"), "{text}");
+        assert!(text.contains("processing ledger"), "{text}");
+        assert_eq!(text.matches('\n').count(), 1, "{text:?}");
         Ok(())
     }
 }

@@ -159,7 +159,7 @@ val status --json
 
 ### `monitor`
 
-Debug-watches the Firedancer GUI websocket and prints boot/startup state.
+Watches the Firedancer GUI websocket and prints the current boot/startup state.
 This does not take the exclusive `val` lock, so `status` and other commands
 can still run.
 
@@ -167,9 +167,16 @@ can still run.
 val monitor
 ```
 
-On connect it prints `summary.startup_progress` and `summary.boot_progress`
-payloads as they change. Other websocket keys are named once so you can see
-traffic without flooding the terminal. For a full dump:
+The active state is one compact line with a live elapsed timer. When the phase
+changes, the completed state remains on its own line with its final duration
+and the next state starts counting from zero:
+
+```text
+downloading full snapshot .............. 3m 28s
+loading ledger ......................... 12s
+```
+
+For the unfiltered websocket payloads:
 
 ```sh
 val monitor --all
