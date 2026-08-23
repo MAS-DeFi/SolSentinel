@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use tracing::Level;
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{
     EnvFilter, Layer, filter::filter_fn, fmt, layer::SubscriberExt, util::SubscriberInitExt,
@@ -30,14 +31,10 @@ pub fn init(log_dir: &Path, verbosity: u8, compact_terminal: bool) -> Result<Wor
         .lossy(false)
         .finish(file_appender);
 
-    let default_filter = if compact_terminal && verbosity == 0 {
-        "warn".to_owned()
-    } else {
-        match verbosity {
-            0 => "info".to_owned(),
-            1 => "debug".to_owned(),
-            _ => "trace".to_owned(),
-        }
+    let default_filter = match verbosity {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
     };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
@@ -45,8 +42,8 @@ pub fn init(log_dir: &Path, verbosity: u8, compact_terminal: bool) -> Result<Wor
     let terminal_layer = fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(false)
-        .with_filter(filter_fn(|metadata| {
-            metadata.target() != COMMAND_OUTPUT_TARGET
+        .with_filter(filter_fn(move |metadata| {
+            terminal_event_enabled(metadata.target(), metadata.level(), compact_terminal)
         }));
     let file_layer = fmt::layer().with_ansi(false).with_writer(file_writer);
 
@@ -58,6 +55,19 @@ pub fn init(log_dir: &Path, verbosity: u8, compact_terminal: bool) -> Result<Wor
         .context("could not initialize logging")?;
 
     Ok(guard)
+}
+
+/// Returns whether a tracing event should appear on the operator terminal.
+fn terminal_event_enabled(target: &str, level: &Level, compact_terminal: bool) -> bool {
+    if target == COMMAND_OUTPUT_TARGET {
+        return false;
+    }
+    if compact_terminal {
+        // tracing::Level is ordered TRACE > DEBUG > INFO > WARN > ERROR.
+        *level <= Level::WARN
+    } else {
+        true
+    }
 }
 
 struct SecureRotatingFile {
@@ -175,7 +185,9 @@ mod tests {
     use anyhow::Result;
     use tempfile::TempDir;
 
-    use super::SecureRotatingFile;
+    use super::{SecureRotatingFile, terminal_event_enabled};
+    use crate::process::COMMAND_OUTPUT_TARGET;
+    use tracing::Level;
 
     #[test]
     fn rotates_at_size_limit_and_secures_permissions() -> Result<()> {
@@ -193,5 +205,39 @@ mod tests {
         );
         assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
         Ok(())
+    }
+
+    #[test]
+    fn compact_terminal_hides_info_and_command_output() {
+        assert!(!terminal_event_enabled(
+            "val::repository",
+            &Level::INFO,
+            true
+        ));
+        assert!(terminal_event_enabled(
+            "val::repository",
+            &Level::WARN,
+            true
+        ));
+        assert!(terminal_event_enabled(
+            "val::repository",
+            &Level::ERROR,
+            true
+        ));
+        assert!(!terminal_event_enabled(
+            COMMAND_OUTPUT_TARGET,
+            &Level::INFO,
+            true
+        ));
+        assert!(terminal_event_enabled(
+            "val::repository",
+            &Level::INFO,
+            false
+        ));
+        assert!(!terminal_event_enabled(
+            COMMAND_OUTPUT_TARGET,
+            &Level::INFO,
+            false
+        ));
     }
 }

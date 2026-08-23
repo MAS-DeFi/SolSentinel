@@ -1,11 +1,11 @@
 //! Structured subprocess execution and output relaying.
 
 use std::{
-    cell::Cell,
     ffi::{OsStr, OsString},
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     thread,
 };
 
@@ -14,18 +14,16 @@ use tracing::{debug, info, warn};
 
 pub const COMMAND_OUTPUT_TARGET: &str = "val::command_output";
 
-thread_local! {
-    static COMPACT_OUTPUT: Cell<bool> = const { Cell::new(false) };
-}
+static COMPACT_OUTPUT: AtomicBool = AtomicBool::new(false);
 
 /// Enables or disables compact terminal output for streaming child processes.
 pub fn set_compact_output(compact: bool) {
-    COMPACT_OUTPUT.with(|flag| flag.set(compact));
+    COMPACT_OUTPUT.store(compact, Ordering::SeqCst);
 }
 
 /// Returns whether streaming child output should be kept off the terminal.
 pub fn compact_output() -> bool {
-    COMPACT_OUTPUT.with(|flag| flag.get())
+    COMPACT_OUTPUT.load(Ordering::SeqCst)
 }
 
 /// Restores compact output when dropped.
@@ -195,10 +193,12 @@ impl Runner for SystemRunner {
             .stderr
             .take()
             .context("could not capture command stderr")?;
+        // Capture on this thread: relay workers do not share thread-locals.
+        let to_terminal = !compact_output();
 
         let status = thread::scope(|scope| -> Result<_> {
-            let stdout_thread = scope.spawn(move || relay(stdout, Stream::Stdout));
-            let stderr_thread = scope.spawn(move || relay(stderr, Stream::Stderr));
+            let stdout_thread = scope.spawn(move || relay(stdout, Stream::Stdout, to_terminal));
+            let stderr_thread = scope.spawn(move || relay(stderr, Stream::Stderr, to_terminal));
             let status = child
                 .wait()
                 .with_context(|| format!("could not wait for {}", spec.display()))?;
@@ -280,11 +280,11 @@ enum Stream {
     Stderr,
 }
 
-/// Drains one child stream to the terminal and command log.
-fn relay(reader: impl io::Read, stream: Stream) -> io::Result<()> {
+/// Drains one child stream to the command log, and to the terminal unless compact.
+fn relay(reader: impl io::Read, stream: Stream, to_terminal: bool) -> io::Result<()> {
     let mut reader = BufReader::new(reader);
     let mut buffer = Vec::new();
-    let mut terminal_open = !compact_output();
+    let mut terminal_open = to_terminal;
 
     loop {
         buffer.clear();
@@ -394,7 +394,17 @@ mod tests {
     }
 
     #[test]
+    fn compact_output_is_visible_to_worker_threads() {
+        let _lock = compact_test_lock();
+        let _guard = CompactOutputGuard::enable();
+        let seen =
+            std::thread::scope(|scope| scope.spawn(compact_output).join().expect("worker thread"));
+        assert!(seen);
+    }
+
+    #[test]
     fn compact_output_guard_restores_on_drop() {
+        let _lock = compact_test_lock();
         assert!(!compact_output());
         {
             let _guard = CompactOutputGuard::enable();
@@ -405,6 +415,7 @@ mod tests {
 
     #[test]
     fn compact_output_flag_tracks_state() {
+        let _lock = compact_test_lock();
         set_compact_output(true);
         assert!(compact_output());
         set_compact_output(false);
@@ -412,10 +423,8 @@ mod tests {
     }
 
     #[test]
-    fn compact_mode_suppresses_streaming_child_terminal_output() {
-        static LOCK: Mutex<()> = Mutex::new(());
-
-        let _lock = LOCK.lock().expect("compact output test lock");
+    fn compact_mode_keeps_streaming_child_output_off_the_terminal() {
+        let _lock = compact_test_lock();
         let _guard = CompactOutputGuard::enable();
 
         let outcome = SystemRunner
@@ -425,8 +434,13 @@ mod tests {
             ]))
             .expect("streaming command");
         assert!(outcome.success);
+        assert!(compact_output());
+    }
 
-        // Child output is still logged through tracing; compact mode only hides the
-        // direct terminal relay used by update-full's noisy git/deps/make stages.
+    fn compact_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let guard = LOCK.lock().expect("compact output test lock");
+        set_compact_output(false);
+        guard
     }
 }

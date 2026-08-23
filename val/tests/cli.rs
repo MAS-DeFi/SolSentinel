@@ -380,7 +380,12 @@ case "$1" in
       esac
     fi
     ;;
-  fetch|status|checkout|submodule|reset|clean) exit 0 ;;
+  fetch)
+    printf 'git-fetch-noise\n'
+    printf 'git-fetch-noise\n' >&2
+    exit 0
+    ;;
+  status|checkout|submodule|reset|clean) exit 0 ;;
   *) exit 0 ;;
 esac
 "#,
@@ -389,6 +394,8 @@ esac
         &bin_dir.join("make"),
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$MAKE_LOG"
+printf 'make-noise\n'
+printf 'make-noise\n' >&2
 mkdir -p "$REPO_PATH/build/native/gcc/bin"
 cat > "$REPO_PATH/build/native/gcc/bin/fdctl" <<'EOF'
 #!/bin/sh
@@ -403,7 +410,7 @@ exit 0
     fs::create_dir_all(&repo).expect("repository directory");
     write_executable(
         &repo.join("deps.sh"),
-        "#!/bin/sh\nprintf '%s\n' \"$*\" >> \"$DEPS_LOG\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DEPS_LOG\"\nprintf 'deps-noise\\n'\nprintf 'deps-noise\\n' >&2\n",
     );
 
     let config = temp.path().join("active-fd-config.toml");
@@ -436,6 +443,7 @@ exit 0
         .env("MAKE_LOG", &make_log)
         .env("DEPS_LOG", &deps_log)
         .env("REPO_PATH", repo.to_str().expect("UTF-8 repo path"))
+        .env_remove("RUST_LOG")
         .output()
         .expect("run val update-full");
 
@@ -452,11 +460,30 @@ exit 0
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stdout.contains("[1/3] Update Firedancer (vTEST)"));
     assert!(stdout.contains("[2/3] Build Firedancer"));
     assert!(stdout.contains("[3/3] Restart service"));
     assert!(stdout.contains("Update complete: vTEST"));
     assert!(stdout.contains("Detailed log:"));
+    assert!(
+        !stdout.contains("git-fetch-noise")
+            && !stderr.contains("git-fetch-noise")
+            && !stdout.contains("make-noise")
+            && !stderr.contains("make-noise")
+            && !stdout.contains("deps-noise")
+            && !stderr.contains("deps-noise"),
+        "compact update-full should hide git/make/deps streams\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("val command started"),
+        "compact update-full should hide info tracing on stderr: {stderr}"
+    );
+
+    let log = fs::read_to_string(log_dir.join("val.log")).expect("val log");
+    assert!(log.contains("git-fetch-noise"), "{log}");
+    assert!(log.contains("make-noise"), "{log}");
+    assert!(log.contains("deps-noise"), "{log}");
 
     let systemctl = fs::read_to_string(&systemctl_log).expect("systemctl log");
     let stop_at = first_line_with_word(&systemctl, "stop").expect("systemctl stop");
