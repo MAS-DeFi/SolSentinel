@@ -309,4 +309,21 @@ esac
         fdctl_invocations.contains(config.to_str().expect("UTF-8 config path")),
         "{fdctl_invocations}"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stop_segment = stderr
+        .find("starting restart segment: stop")
+        .expect("stop segment log");
+    let configure_1 = stderr
+        .find("starting restart segment: configure 1/2")
+        .expect("configure 1/2 segment log");
+    let configure_2 = stderr
+        .find("starting restart segment: configure 2/2")
+        .expect("configure 2/2 segment log");
+    let start_segment = stderr
+        .find("starting restart segment: start")
+        .expect("start segment log");
+    assert!(
+        stop_segment < configure_1 && configure_1 < configure_2 && configure_2 < start_segment,
+        "restart segments should print in order: {stderr}"
+    );
 }

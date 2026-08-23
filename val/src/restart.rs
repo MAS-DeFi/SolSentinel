@@ -19,9 +19,13 @@ pub fn restart_firedancer(
     config: &Path,
 ) -> Result<()> {
     info!("restarting Firedancer (stop, configure, configure, start)");
+    info!("starting restart segment: stop");
     service.stop()?;
+    info!("starting restart segment: configure 1/2");
     configure::configure_firedancer(runner, repository, config)?;
+    info!("starting restart segment: configure 2/2");
     configure::configure_firedancer(runner, repository, config)?;
+    info!("starting restart segment: start");
     service.start()?;
     info!("Firedancer restart completed");
     Ok(())
