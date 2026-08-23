@@ -80,9 +80,17 @@ pub fn update_firedancer(runner: &dyn Runner, repository: &Path, git_ref: &str) 
         bail!("dependency installer does not exist: {}", deps.display());
     }
 
-    info!("running Firedancer dependency installer; it may request confirmation");
+    // No-args deps.sh prompts "Continue? (y/N)". Passing the default actions
+    // skips that prompt. FD_AUTO_INSTALL_PACKAGES answers the later package
+    // and rustup prompts so an unattended update does not block.
+    info!("running Firedancer dependency installer");
     require_success(
-        runner.interactive(&CommandSpec::new(deps).cwd(repository))?,
+        runner.streaming(
+            &CommandSpec::new(deps)
+                .args(["fetch", "check", "install"])
+                .env("FD_AUTO_INSTALL_PACKAGES", "1")
+                .cwd(repository),
+        )?,
         "Firedancer deps.sh",
     )?;
 
@@ -380,6 +388,18 @@ mod tests {
             .collect()
     }
 
+    fn env_strings(spec: &CommandSpec) -> Vec<(String, String)> {
+        spec.env
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect()
+    }
+
     fn run_git(path: &Path, args: &[&str]) -> Result<String> {
         let mut command = Command::new("git");
         command
@@ -623,6 +643,47 @@ mod tests {
                 "--force",
                 "--checkout"
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_runs_deps_sh_without_confirmation_prompts() -> Result<()> {
+        let repository = TempDir::new()?;
+        fs::write(repository.path().join("deps.sh"), "#!/bin/sh\n")?;
+        let commit = "0123456789012345678901234567890123456789\n";
+        let runner = FakeRunner {
+            captures: Mutex::new(VecDeque::from([
+                CommandOutcome::success("true\n"),
+                CommandOutcome::success(commit),
+                CommandOutcome::failure(128, "no HEAD"),
+                CommandOutcome::success(""),
+            ])),
+            capture_specs: Mutex::new(Vec::new()),
+            streaming: Mutex::new(VecDeque::from(vec![CommandOutcome::success(""); 5])),
+            streaming_specs: Mutex::new(Vec::new()),
+            interactive: Mutex::new(VecDeque::new()),
+        };
+
+        update_firedancer(&runner, repository.path(), "v1.2.3")?;
+
+        let specs = runner.streaming_specs.lock().expect("streaming specs lock");
+        assert_eq!(specs.len(), 5);
+        assert_eq!(
+            specs[4].program,
+            repository.path().join("deps.sh").as_os_str()
+        );
+        assert_eq!(arg_strings(&specs[4]), ["fetch", "check", "install"]);
+        assert_eq!(
+            env_strings(&specs[4]),
+            [("FD_AUTO_INSTALL_PACKAGES".to_owned(), "1".to_owned())]
+        );
+        assert!(
+            runner
+                .interactive
+                .lock()
+                .expect("interactive lock")
+                .is_empty()
         );
         Ok(())
     }

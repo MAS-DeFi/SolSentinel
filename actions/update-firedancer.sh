@@ -107,10 +107,12 @@ git submodule sync --recursive 2>&1 | tee -a "$LOG_FILE"
 git submodule update --init --recursive --force --checkout 2>&1 | tee -a "$LOG_FILE"
 log "✅ Submodules updated"
 
-# Run deps.sh attached to the terminal (NOT piped through tee) so its manual
-# approval prompt stays visible and interactive, as the README flow requires.
-log "📦 Installing dependencies (deps.sh) — approve the prompt if asked..."
-if ! ./deps.sh; then
+# No-args deps.sh prompts "Continue? (y/N)". Passing the default actions skips
+# that prompt. FD_AUTO_INSTALL_PACKAGES answers later package/rustup prompts.
+# Keep this attached to the terminal (not piped through tee) so sudo can still
+# read a password from the TTY if package install needs it.
+log "📦 Installing dependencies (deps.sh)..."
+if ! FD_AUTO_INSTALL_PACKAGES=1 ./deps.sh fetch check install; then
     log "❌ ERROR: deps.sh failed"
     exit 1
 fi

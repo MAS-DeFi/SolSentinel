@@ -17,6 +17,7 @@ pub const COMMAND_OUTPUT_TARGET: &str = "val::command_output";
 pub struct CommandSpec {
     pub program: OsString,
     pub args: Vec<OsString>,
+    pub env: Vec<(OsString, OsString)>,
     pub cwd: Option<PathBuf>,
 }
 
@@ -26,6 +27,7 @@ impl CommandSpec {
         Self {
             program: program.into(),
             args: Vec::new(),
+            env: Vec::new(),
             cwd: None,
         }
     }
@@ -46,6 +48,12 @@ impl CommandSpec {
         self
     }
 
+    /// Sets an environment variable in the child process.
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
     /// Sets the child working directory.
     pub fn cwd(mut self, path: impl Into<PathBuf>) -> Self {
         self.cwd = Some(path.into());
@@ -54,7 +62,12 @@ impl CommandSpec {
 
     /// Formats the command for diagnostic logs.
     pub fn display(&self) -> String {
-        let mut parts = vec![quoted(&self.program)];
+        let mut parts: Vec<String> = self
+            .env
+            .iter()
+            .map(|(key, value)| format!("{}={}", key.to_string_lossy(), quoted(value)))
+            .collect();
+        parts.push(quoted(&self.program));
         parts.extend(self.args.iter().map(|arg| quoted(arg)));
         parts.join(" ")
     }
@@ -202,6 +215,9 @@ impl Runner for SystemRunner {
 fn configured_command(spec: &CommandSpec) -> Command {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
+    for (key, value) in &spec.env {
+        command.env(key, value);
+    }
     if let Some(cwd) = &spec.cwd {
         command.current_dir(cwd);
     }
@@ -311,4 +327,33 @@ pub fn require_success(outcome: CommandOutcome, description: &str) -> Result<Com
 /// Resolves an executable path inside a directory.
 pub fn executable_in(directory: &Path, relative: &str) -> PathBuf {
     directory.join(relative)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommandSpec, Runner, SystemRunner};
+
+    #[test]
+    fn capture_includes_configured_environment() {
+        let outcome = SystemRunner
+            .capture(
+                &CommandSpec::new("sh")
+                    .args(["-c", "printf %s \"$TEST_VAL_ENV\""])
+                    .env("TEST_VAL_ENV", "ok"),
+            )
+            .expect("capture command");
+        assert!(outcome.success);
+        assert_eq!(outcome.stdout, "ok");
+    }
+
+    #[test]
+    fn display_includes_environment_assignments() {
+        let spec = CommandSpec::new("deps.sh")
+            .args(["fetch", "check", "install"])
+            .env("FD_AUTO_INSTALL_PACKAGES", "1");
+        assert_eq!(
+            spec.display(),
+            "FD_AUTO_INSTALL_PACKAGES=\"1\" \"deps.sh\" \"fetch\" \"check\" \"install\""
+        );
+    }
 }

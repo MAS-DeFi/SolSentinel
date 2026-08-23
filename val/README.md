@@ -63,7 +63,8 @@ val status
    the update continues so a forced submodule update can repair the tree.
 5. Performs a forced detached checkout of the resolved commit.
 6. Syncs submodule URLs and force-updates all submodules.
-7. Runs `deps.sh` interactively.
+7. Runs `deps.sh fetch check install` with `FD_AUTO_INSTALL_PACKAGES=1` so
+   the Continue/package/rustup prompts are not waiting for a human.
 
 The command is safe to repeat for the same ref. Dependency installation is
 still run on repeats so an interrupted first attempt can repair itself.

@@ -130,8 +130,8 @@ export FIREDANCER_REF=vX.Y.Z
 # Schedule a maintenance window and stop the validator before replacing it.
 sudo systemctl stop frankendancer.service
 
-# Fetch the release and install its dependencies. Approve the deps.sh prompt
-# if asked. Run as the validator user; using sudo is also supported.
+# Fetch the release and install its dependencies. Run as the validator user;
+# using sudo is also supported.
 ./update-firedancer.sh "$FIREDANCER_REF"
 
 # Build Firedancer. This typically takes about 3.5 minutes.
