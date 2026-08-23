@@ -278,6 +278,7 @@ fn is_unavailable_websocket(error: &tungstenite::Error) -> bool {
         tungstenite::Error::Http(_)
         | tungstenite::Error::HttpFormat(_)
         | tungstenite::Error::Protocol(_) => true,
+        tungstenite::Error::Url(tungstenite::error::UrlError::UnableToConnect(_)) => true,
         _ => false,
     }
 }
@@ -389,6 +390,17 @@ mod tests {
             "connection refused",
         ));
         assert!(is_unavailable(&error));
+    }
+
+    #[test]
+    fn tungstenite_unable_to_connect_is_unavailable() {
+        let error = anyhow::Error::from(tungstenite::Error::Url(
+            tungstenite::error::UrlError::UnableToConnect(
+                "ws://127.0.0.1:80/websocket".to_owned(),
+            ),
+        ))
+        .context("could not connect to Firedancer GUI at ws://127.0.0.1:80/websocket");
+        assert!(is_unavailable(&error), "{error:#}");
     }
 
     #[test]
