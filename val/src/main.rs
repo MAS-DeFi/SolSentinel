@@ -129,7 +129,7 @@ fn dispatch(cli: &Cli, paths: &AppPaths) -> Result<()> {
             restart::restart_firedancer(&runner, &service, &paths.repository, &paths.config)
         }
         Commands::Status { json } => {
-            let report = StatusReport::load(
+            let report = StatusReport::collect(
                 paths,
                 service.state()?,
                 service.running_fdctl_version()?,

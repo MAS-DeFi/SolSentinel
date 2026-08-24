@@ -12,11 +12,12 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use zeroize::Zeroizing;
 
-use crate::{paths::AppPaths, service::ServiceState};
+use crate::{monitor, paths::AppPaths, service::ServiceState};
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct StatusReport {
     pub service: String,
+    pub validator_state: Option<String>,
     pub running_fdctl_version: Option<String>,
     pub built_fdctl_version: Option<String>,
     pub active_id_key: String,
@@ -34,12 +35,39 @@ pub enum SnapshotFetchSource {
 }
 
 impl StatusReport {
+    /// Loads service, identity, snapshot-fetch, and validator GUI state.
+    pub fn collect(
+        paths: &AppPaths,
+        service_state: ServiceState,
+        running_fdctl_version: Option<String>,
+        built_fdctl_version: Option<String>,
+    ) -> Result<Self> {
+        let validator_state = match monitor::current_state(&paths.config, None) {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "could not query validator state from Firedancer GUI"
+                );
+                None
+            }
+        };
+        Self::load(
+            paths,
+            service_state,
+            running_fdctl_version,
+            built_fdctl_version,
+            validator_state,
+        )
+    }
+
     /// Loads service, identity, and snapshot-fetch status.
     pub fn load(
         paths: &AppPaths,
         service_state: ServiceState,
         running_fdctl_version: Option<String>,
         built_fdctl_version: Option<String>,
+        validator_state: Option<String>,
     ) -> Result<Self> {
         let config_text = fs::read_to_string(&paths.config).with_context(|| {
             format!(
@@ -66,6 +94,7 @@ impl StatusReport {
 
         Ok(Self {
             service: service_state.to_string(),
+            validator_state,
             running_fdctl_version,
             built_fdctl_version,
             active_id_key,
@@ -83,6 +112,11 @@ impl StatusReport {
             SnapshotFetchSource::FiredancerDefault => "Firedancer default",
         };
         writeln!(output, "service: {}", self.service)?;
+        writeln!(
+            output,
+            "validator state: {}",
+            self.validator_state.as_deref().unwrap_or("unavailable")
+        )?;
         writeln!(
             output,
             "running fdctl version: {}",
@@ -229,11 +263,12 @@ fn warn_if_key_permissions_are_open(_: &Path) {}
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, net::TcpListener, path::PathBuf, thread, time::Duration};
 
     use anyhow::Result;
     use ed25519_dalek::SigningKey;
     use tempfile::TempDir;
+    use tungstenite::{Message, accept};
 
     use super::{SnapshotFetchSource, StatusReport};
     use crate::{paths::AppPaths, service::ServiceState};
@@ -271,8 +306,13 @@ mod tests {
             ServiceState::Active,
             Some("v1.2.3".to_owned()),
             Some("v1.2.4".to_owned()),
+            Some("downloading full snapshot".to_owned()),
         )?;
         assert_eq!(report.service, "active");
+        assert_eq!(
+            report.validator_state.as_deref(),
+            Some("downloading full snapshot")
+        );
         assert_eq!(report.running_fdctl_version.as_deref(), Some("v1.2.3"));
         assert_eq!(report.built_fdctl_version.as_deref(), Some("v1.2.4"));
         assert_eq!(report.active_id_key, bs58::encode(public).into_string());
@@ -303,7 +343,8 @@ mod tests {
             ),
         )?;
 
-        let report = StatusReport::load(&paths, ServiceState::Inactive, None, None)?;
+        let report = StatusReport::load(&paths, ServiceState::Inactive, None, None, None)?;
+        assert_eq!(report.validator_state, None);
         assert!(report.snapshot_fetch);
         assert_eq!(
             report.snapshot_fetch_source,
@@ -327,6 +368,86 @@ mod tests {
         let config_text = fs::read_to_string(&paths.config)?;
         let config = toml::from_str(&config_text)?;
         assert_eq!(super::resolve_identity_path(&config, &paths)?, identity);
+        Ok(())
+    }
+
+    #[test]
+    fn collect_uses_monitor_for_validator_state() -> Result<()> {
+        let temp = TempDir::new()?;
+        let paths = paths(&temp);
+        let identity = temp.path().join("active-id.json");
+        let secret = [3_u8; 32];
+        let mut bytes = secret.to_vec();
+        bytes.extend(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
+        fs::write(&identity, serde_json::to_string(&bytes)?)?;
+
+        let server = TcpListener::bind("127.0.0.1:0")?;
+        let port = server.local_addr()?.port();
+        fs::write(
+            &paths.config,
+            format!(
+                "[consensus]\nidentity_path = {:?}\n[tiles.gui]\nenabled = true\ngui_listen_address = \"127.0.0.1\"\ngui_listen_port = {port}\n",
+                identity.to_string_lossy()
+            ),
+        )?;
+        thread::spawn(move || {
+            let (stream, _) = server.accept().expect("accept");
+            let mut socket = accept(stream).expect("websocket handshake");
+            socket
+                .send(Message::Text(
+                    r#"{"topic":"summary","key":"startup_progress","value":{"phase":"loading_ledger"}}"#
+                        .into(),
+                ))
+                .expect("send payload");
+            socket.send(Message::Close(None)).expect("close");
+            thread::sleep(Duration::from_millis(50));
+        });
+
+        let report = StatusReport::collect(&paths, ServiceState::Active, None, None)?;
+        assert_eq!(report.validator_state.as_deref(), Some("loading ledger"));
+        Ok(())
+    }
+
+    #[test]
+    fn collect_reports_unavailable_when_gui_is_disabled() -> Result<()> {
+        let temp = TempDir::new()?;
+        let paths = paths(&temp);
+        let identity = temp.path().join("active-id.json");
+        let secret = [4_u8; 32];
+        let mut bytes = secret.to_vec();
+        bytes.extend(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
+        fs::write(&identity, serde_json::to_string(&bytes)?)?;
+        fs::write(
+            &paths.config,
+            format!(
+                "[consensus]\nidentity_path = {:?}\n[tiles.gui]\nenabled = false\n",
+                identity.to_string_lossy()
+            ),
+        )?;
+
+        let report = StatusReport::collect(&paths, ServiceState::Active, None, None)?;
+        assert_eq!(report.validator_state, None);
+        Ok(())
+    }
+
+    #[test]
+    fn write_human_includes_validator_state() -> Result<()> {
+        let report = StatusReport {
+            service: "active".to_owned(),
+            validator_state: Some("running".to_owned()),
+            running_fdctl_version: Some("v1.0.0".to_owned()),
+            built_fdctl_version: Some("v1.0.0".to_owned()),
+            active_id_key: "abc".to_owned(),
+            identity_path: "/tmp/id.json".to_owned(),
+            snapshot_fetch: true,
+            snapshot_fetch_source: SnapshotFetchSource::Configured,
+            config_path: "/tmp/config.toml".to_owned(),
+        };
+        let mut output = Vec::new();
+        report.write_human(&mut output)?;
+        let text = String::from_utf8(output)?;
+        assert!(text.contains("service: active"), "{text}");
+        assert!(text.contains("validator state: running"), "{text}");
         Ok(())
     }
 }
