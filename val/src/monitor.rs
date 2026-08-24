@@ -3,6 +3,7 @@
 use std::{
     fs,
     io::{self, ErrorKind, IsTerminal, Write},
+    net::{TcpStream, ToSocketAddrs},
     path::Path,
     thread,
     time::{Duration, Instant},
@@ -12,11 +13,12 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
-use tungstenite::{Message, connect, stream::MaybeTlsStream};
+use tungstenite::{Message, client::IntoClientRequest, connect, stream::MaybeTlsStream};
 
 const DEFAULT_GUI_ADDRESS: &str = "127.0.0.1";
 const DEFAULT_GUI_PORT: u16 = 80;
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_COLUMN: usize = 42;
 
 /// Connects to the Firedancer GUI websocket and prints boot/startup state.
@@ -31,20 +33,17 @@ pub fn run(config_path: &Path, url_override: Option<&str>, all: bool) -> Result<
     watch(&url, all, live, &mut stdout.lock())
 }
 
+/// Reads the current validator boot/startup phase from the Firedancer GUI.
+///
+/// Returns `Ok(None)` when the GUI is disabled, the websocket is unavailable,
+/// or no startup/boot progress arrives before the snapshot timeout.
+pub fn current_state(config_path: &Path, url_override: Option<&str>) -> Result<Option<String>> {
+    snapshot_state(config_path, url_override, SNAPSHOT_TIMEOUT)
+}
+
 /// Reads the GUI listen address from a Firedancer TOML config.
 fn websocket_url_from_config(config_path: &Path) -> Result<String> {
-    let config_text = fs::read_to_string(config_path).with_context(|| {
-        format!(
-            "could not read active Firedancer config {}",
-            config_path.display()
-        )
-    })?;
-    let endpoint = GuiEndpoint::from_toml(&config_text).with_context(|| {
-        format!(
-            "could not parse Firedancer GUI settings from {}",
-            config_path.display()
-        )
-    })?;
+    let endpoint = gui_endpoint_from_config(config_path)?;
     if !endpoint.enabled {
         bail!(
             "Firedancer GUI is disabled in {} ([tiles.gui].enabled = false)",
@@ -52,6 +51,100 @@ fn websocket_url_from_config(config_path: &Path) -> Result<String> {
         );
     }
     Ok(endpoint.websocket_url())
+}
+
+fn gui_endpoint_from_config(config_path: &Path) -> Result<GuiEndpoint> {
+    let config_text = fs::read_to_string(config_path).with_context(|| {
+        format!(
+            "could not read active Firedancer config {}",
+            config_path.display()
+        )
+    })?;
+    GuiEndpoint::from_toml(&config_text).with_context(|| {
+        format!(
+            "could not parse Firedancer GUI settings from {}",
+            config_path.display()
+        )
+    })
+}
+
+fn snapshot_state(
+    config_path: &Path,
+    url_override: Option<&str>,
+    timeout: Duration,
+) -> Result<Option<String>> {
+    let url = match url_override {
+        Some(url) => url.to_owned(),
+        None => {
+            let endpoint = gui_endpoint_from_config(config_path)?;
+            if !endpoint.enabled {
+                return Ok(None);
+            }
+            endpoint.websocket_url()
+        }
+    };
+    match fetch_current_phase(&url, timeout) {
+        Ok(Some(phase)) => {
+            info!(validator_state = %phase, "read validator state from Firedancer GUI");
+            Ok(Some(phase))
+        }
+        Ok(None) => Ok(None),
+        Err(error) if is_unavailable(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn fetch_current_phase(url: &str, timeout: Duration) -> Result<Option<String>> {
+    let mut socket = connect_plain(url, timeout)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        match socket.read() {
+            Ok(Message::Text(payload)) => {
+                if let Some(phase) = progress_phase(&payload) {
+                    return Ok(Some(phase));
+                }
+            }
+            Ok(Message::Close(_)) => return Ok(None),
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error)) if is_refresh_timeout(&error) => return Ok(None),
+            Err(error) if is_unavailable_websocket(&error) => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Firedancer GUI websocket {url} closed"));
+            }
+        }
+    }
+}
+
+fn connect_plain(url: &str, timeout: Duration) -> Result<tungstenite::WebSocket<TcpStream>> {
+    let request = url
+        .into_client_request()
+        .with_context(|| format!("invalid Firedancer GUI websocket URL {url}"))?;
+    let host = request
+        .uri()
+        .host()
+        .context("Firedancer GUI websocket URL is missing a host")?
+        .to_owned();
+    let port = request.uri().port_u16().unwrap_or(DEFAULT_GUI_PORT);
+    let addr = (host.as_str(), port)
+        .to_socket_addrs()
+        .with_context(|| format!("could not resolve Firedancer GUI at {url}"))?
+        .next()
+        .with_context(|| format!("could not resolve Firedancer GUI at {url}"))?;
+    let stream = TcpStream::connect_timeout(&addr, timeout)
+        .with_context(|| format!("could not connect to Firedancer GUI at {url}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("could not configure validator state snapshot timeout")?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .context("could not configure validator state snapshot timeout")?;
+    let (socket, _response) = tungstenite::client(request, stream)
+        .with_context(|| format!("could not connect to Firedancer GUI at {url}"))?;
+    Ok(socket)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -260,10 +353,8 @@ fn handle_text(
                 .unwrap_or_else(|_| message.value.to_string())
         )?;
         out.flush().context("could not write monitor output")?;
-    } else if is_progress_key(&message.topic, &message.key)
-        && let Some(phase) = message.value.get("phase").and_then(Value::as_str)
-    {
-        state.transition(&humanize_phase(phase), out)?;
+    } else if let Some(phase) = progress_phase(payload) {
+        state.transition(&phase, out)?;
     } else {
         state.tick(out)?;
     }
@@ -368,6 +459,18 @@ struct GuiMessage {
     value: Value,
 }
 
+fn progress_phase(payload: &str) -> Option<String> {
+    let message = serde_json::from_str::<GuiMessage>(payload).ok()?;
+    if !is_progress_key(&message.topic, &message.key) {
+        return None;
+    }
+    message
+        .value
+        .get("phase")
+        .and_then(Value::as_str)
+        .map(humanize_phase)
+}
+
 fn is_progress_key(topic: &str, key: &str) -> bool {
     topic == "summary" && matches!(key, "startup_progress" | "boot_progress")
 }
@@ -431,8 +534,8 @@ mod tests {
     use tungstenite::{Message, accept};
 
     use super::{
-        CurrentState, GuiEndpoint, connect_address, is_progress_key, is_unavailable, watch_session,
-        watch_with_retry, websocket_url,
+        CurrentState, GuiEndpoint, connect_address, is_progress_key, is_unavailable,
+        snapshot_state, watch_session, watch_with_retry, websocket_url,
     };
 
     fn serve_one_session(server: TcpListener, payload: &'static str) {
@@ -659,6 +762,74 @@ mod tests {
         assert!(text.contains("5s"), "{text}");
         assert!(text.contains("processing ledger"), "{text}");
         assert_eq!(text.matches('\n').count(), 1, "{text:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn current_state_returns_the_latest_progress_phase() -> Result<()> {
+        let server = TcpListener::bind("127.0.0.1:0")?;
+        let addr = server.local_addr()?;
+        let url = format!("ws://{addr}/websocket");
+        serve_one_session(
+            server,
+            r#"{"topic":"summary","key":"startup_progress","value":{"phase":"downloading_full_snapshot"}}"#,
+        );
+
+        let temp = tempfile::TempDir::new()?;
+        let config = temp.path().join("active-fd-config.toml");
+        std::fs::write(&config, "")?;
+        let state = snapshot_state(&config, Some(&url), Duration::from_secs(2))?;
+        assert_eq!(state.as_deref(), Some("downloading full snapshot"));
+        Ok(())
+    }
+
+    #[test]
+    fn current_state_skips_disabled_gui() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let config = temp.path().join("active-fd-config.toml");
+        std::fs::write(&config, "[tiles.gui]\nenabled = false\n")?;
+        assert_eq!(
+            snapshot_state(&config, None, Duration::from_millis(50))?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn current_state_is_none_when_the_gui_is_down() -> Result<()> {
+        let server = TcpListener::bind("127.0.0.1:0")?;
+        let addr = server.local_addr()?;
+        let url = format!("ws://{addr}/websocket");
+        drop(server);
+
+        let temp = tempfile::TempDir::new()?;
+        let config = temp.path().join("active-fd-config.toml");
+        std::fs::write(&config, "")?;
+        assert_eq!(
+            snapshot_state(&config, Some(&url), Duration::from_millis(200))?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn current_state_reads_gui_listen_settings_from_config() -> Result<()> {
+        let server = TcpListener::bind("127.0.0.1:0")?;
+        let addr = server.local_addr()?;
+        let config_text = format!(
+            "[tiles.gui]\nenabled = true\ngui_listen_address = \"127.0.0.1\"\ngui_listen_port = {}\n",
+            addr.port()
+        );
+        serve_one_session(
+            server,
+            r#"{"topic":"summary","key":"boot_progress","value":{"phase":"running"}}"#,
+        );
+
+        let temp = tempfile::TempDir::new()?;
+        let config = temp.path().join("active-fd-config.toml");
+        std::fs::write(&config, config_text)?;
+        let state = snapshot_state(&config, None, Duration::from_secs(2))?;
+        assert_eq!(state.as_deref(), Some("running"));
         Ok(())
     }
 }

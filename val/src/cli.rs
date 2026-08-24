@@ -76,7 +76,7 @@ pub enum Commands {
     /// Stop the service, run configure-firedancer twice, then start it.
     RestartFiredancer,
 
-    /// Show service state, active identity public key, and snapshot-fetch state.
+    /// Show service state, validator boot/startup state, identity, and snapshot-fetch state.
     Status {
         /// Emit machine-readable JSON.
         #[arg(long)]

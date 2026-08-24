@@ -137,12 +137,19 @@ stopped. This is not a `systemctl restart`.
 Prints:
 
 - systemd service state
+- the current validator boot/startup state from the Firedancer GUI websocket
+  (the same source as `val monitor`)
 - the running service's `fdctl version` (read through `sudo /proc/<pid>/exe`)
 - the current checkout's built `fdctl version`, even when the service is stopped
 - the active identity **public** key
 - identity keypair path
 - whether `[consensus].snapshot_fetch` is enabled
 - active config path
+
+The validator state is a one-shot read of the GUI `startup_progress` /
+`boot_progress` phase. If the GUI is disabled, down, or does not publish a
+phase in time, the field is `unavailable` (JSON `null`) and the rest of the
+status report is still printed.
 
 The keypair bytes are never printed or logged. `consensus.identity_path` is
 authoritative. If it is empty or omitted, the effective Firedancer default

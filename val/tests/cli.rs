@@ -120,6 +120,22 @@ fn lifecycle_commands_use_hyphens_only() {
 }
 
 #[test]
+fn status_help_mentions_validator_state() {
+    let output = Command::new(env!("CARGO_BIN_EXE_val"))
+        .args(["status", "--help"])
+        .output()
+        .expect("run val status --help");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("validator"), "{stdout}");
+    assert!(stdout.contains("--json"), "{stdout}");
+}
+
+#[test]
 fn monitor_help_describes_websocket() {
     let output = Command::new(env!("CARGO_BIN_EXE_val"))
         .args(["monitor", "--help"])
@@ -179,7 +195,7 @@ fn status_json_runs_end_to_end() {
     fs::write(
         &config,
         format!(
-            "[consensus]\nidentity_path = {:?}\nsnapshot_fetch = true\n",
+            "[consensus]\nidentity_path = {:?}\nsnapshot_fetch = true\n[tiles.gui]\nenabled = false\n",
             identity.to_string_lossy()
         ),
     )
@@ -212,6 +228,7 @@ fn status_json_runs_end_to_end() {
     );
     let status: Value = serde_json::from_slice(&output.stdout).expect("status JSON");
     assert_eq!(status["service"], "active");
+    assert!(status["validator_state"].is_null());
     assert!(status["running_fdctl_version"].is_null());
     assert_eq!(status["built_fdctl_version"], "v2.0.0");
     assert_eq!(status["active_id_key"], bs58::encode(public).into_string());
