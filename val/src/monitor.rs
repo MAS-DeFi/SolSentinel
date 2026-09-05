@@ -13,16 +13,50 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::info;
-use tungstenite::{Message, client::IntoClientRequest, connect, stream::MaybeTlsStream};
+use tungstenite::{
+    HandshakeError, Message, WebSocket, client, client::IntoClientRequest, error::ProtocolError,
+};
 
 const DEFAULT_GUI_ADDRESS: &str = "127.0.0.1";
 const DEFAULT_GUI_PORT: u16 = 80;
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_COLUMN: usize = 42;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopWhen {
+    Never,
+    Running,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    Disconnected,
+    Running,
+}
 
 /// Connects to the Firedancer GUI websocket and prints boot/startup state.
 pub fn run(config_path: &Path, url_override: Option<&str>, all: bool) -> Result<()> {
+    run_with_stop(config_path, url_override, all, StopWhen::Never)
+}
+
+/// Watches boot/startup state and returns once the validator reports `running`.
+pub fn wait_until_running(config_path: &Path) -> Result<()> {
+    run_with_stop(config_path, None, false, StopWhen::Running)
+}
+
+/// Verifies that the active config exposes a GUI websocket monitor can use.
+pub fn validate_config(config_path: &Path) -> Result<()> {
+    websocket_url_from_config(config_path).map(|_| ())
+}
+
+fn run_with_stop(
+    config_path: &Path,
+    url_override: Option<&str>,
+    all: bool,
+    stop_when: StopWhen,
+) -> Result<()> {
     let url = match url_override {
         Some(url) => url.to_owned(),
         None => websocket_url_from_config(config_path)?,
@@ -30,7 +64,7 @@ pub fn run(config_path: &Path, url_override: Option<&str>, all: bool) -> Result<
     info!(url = %url, all, "connecting to Firedancer GUI websocket");
     let stdout = io::stdout();
     let live = stdout.is_terminal() && !all;
-    watch(&url, all, live, &mut stdout.lock())
+    watch(&url, all, live, stop_when, &mut stdout.lock())
 }
 
 /// Reads the current validator boot/startup phase from the Firedancer GUI.
@@ -95,7 +129,7 @@ fn snapshot_state(
 }
 
 fn fetch_current_phase(url: &str, timeout: Duration) -> Result<Option<String>> {
-    let mut socket = connect_plain(url, timeout)?;
+    let mut socket = connect_socket(url, timeout)?;
     let deadline = Instant::now() + timeout;
     loop {
         if Instant::now() >= deadline {
@@ -117,34 +151,6 @@ fn fetch_current_phase(url: &str, timeout: Duration) -> Result<Option<String>> {
             }
         }
     }
-}
-
-fn connect_plain(url: &str, timeout: Duration) -> Result<tungstenite::WebSocket<TcpStream>> {
-    let request = url
-        .into_client_request()
-        .with_context(|| format!("invalid Firedancer GUI websocket URL {url}"))?;
-    let host = request
-        .uri()
-        .host()
-        .context("Firedancer GUI websocket URL is missing a host")?
-        .to_owned();
-    let port = request.uri().port_u16().unwrap_or(DEFAULT_GUI_PORT);
-    let addr = (host.as_str(), port)
-        .to_socket_addrs()
-        .with_context(|| format!("could not resolve Firedancer GUI at {url}"))?
-        .next()
-        .with_context(|| format!("could not resolve Firedancer GUI at {url}"))?;
-    let stream = TcpStream::connect_timeout(&addr, timeout)
-        .with_context(|| format!("could not connect to Firedancer GUI at {url}"))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .context("could not configure validator state snapshot timeout")?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .context("could not configure validator state snapshot timeout")?;
-    let (socket, _response) = tungstenite::client(request, stream)
-        .with_context(|| format!("could not connect to Firedancer GUI at {url}"))?;
-    Ok(socket)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -210,17 +216,84 @@ fn websocket_url(address: &str, port: u16) -> String {
     format!("ws://{host}:{port}/websocket")
 }
 
-fn watch(url: &str, all: bool, live: bool, out: &mut impl Write) -> Result<()> {
-    watch_with_retry(url, all, live, out, RETRY_INTERVAL, None)
+fn connect_socket(url: &str, timeout: Duration) -> Result<WebSocket<TcpStream>> {
+    let request = url
+        .into_client_request()
+        .with_context(|| format!("invalid Firedancer GUI websocket URL {url}"))?;
+    let uri = request.uri();
+    if uri.scheme_str() != Some("ws") {
+        bail!("Firedancer GUI websocket URL must use ws://: {url}");
+    }
+    let host = uri
+        .host()
+        .with_context(|| format!("Firedancer GUI websocket URL has no host: {url}"))?;
+    // URI authorities retain IPv6 brackets; socket resolution expects the bare address.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let port = uri.port_u16().unwrap_or(DEFAULT_GUI_PORT);
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("could not resolve Firedancer GUI host {host}"))?;
+
+    let mut connected = None;
+    let mut last_error = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let stream = connected
+        .ok_or_else(|| {
+            last_error.unwrap_or_else(|| {
+                io::Error::new(
+                    ErrorKind::AddrNotAvailable,
+                    format!("Firedancer GUI host {host} resolved to no addresses"),
+                )
+            })
+        })
+        .with_context(|| format!("could not connect to Firedancer GUI at {url}"))?;
+
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("could not configure Firedancer GUI handshake read timeout")?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .context("could not configure Firedancer GUI handshake write timeout")?;
+    match client(request, stream) {
+        Ok((socket, _response)) => Ok(socket),
+        Err(HandshakeError::Failure(error)) => Err(anyhow::Error::from(error))
+            .with_context(|| format!("could not connect to Firedancer GUI at {url}")),
+        Err(HandshakeError::Interrupted(_)) => Err(io::Error::new(
+            ErrorKind::TimedOut,
+            "Firedancer GUI websocket handshake timed out",
+        ))
+        .with_context(|| format!("could not connect to Firedancer GUI at {url}")),
+    }
+}
+
+fn watch(
+    url: &str,
+    all: bool,
+    live: bool,
+    stop_when: StopWhen,
+    out: &mut impl Write,
+) -> Result<()> {
+    watch_with_retry(url, all, live, stop_when, out, RETRY_INTERVAL)
 }
 
 fn watch_with_retry(
     url: &str,
     all: bool,
     live: bool,
+    stop_when: StopWhen,
     out: &mut impl Write,
     retry_interval: Duration,
-    max_sessions: Option<usize>,
 ) -> Result<()> {
     let started = Instant::now();
     if all {
@@ -230,20 +303,30 @@ fn watch_with_retry(
 
     let mut unavailable = false;
     let mut state = CurrentState::new(live);
-    let mut sessions = 0;
     loop {
-        match watch_session(url, all, started, &mut unavailable, &mut state, out) {
-            Ok(()) => {
-                sessions += 1;
-                if max_sessions.is_some_and(|max| sessions >= max) {
-                    return Ok(());
-                }
+        match watch_session(
+            url,
+            all,
+            stop_when,
+            started,
+            &mut unavailable,
+            &mut state,
+            out,
+        ) {
+            Ok(SessionEnd::Running) => {
+                state.finish(out)?;
+                return Ok(());
+            }
+            Ok(SessionEnd::Disconnected) => {
                 announce_unavailable(all, started, &mut unavailable, &mut state, out)?;
             }
             Err(error) if is_unavailable(&error) => {
                 announce_unavailable(all, started, &mut unavailable, &mut state, out)?;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                state.finish(out)?;
+                return Err(error);
+            }
         }
         thread::sleep(retry_interval);
         state.tick(out)?;
@@ -274,13 +357,13 @@ fn announce_unavailable(
 fn watch_session(
     url: &str,
     all: bool,
+    stop_when: StopWhen,
     started: Instant,
     unavailable: &mut bool,
     state: &mut CurrentState,
     out: &mut impl Write,
-) -> Result<()> {
-    let (mut socket, _response) =
-        connect(url).with_context(|| format!("could not connect to Firedancer GUI at {url}"))?;
+) -> Result<SessionEnd> {
+    let mut socket = connect_socket(url, CONNECT_TIMEOUT)?;
     *unavailable = false;
     if all {
         writeln!(out, "+{:.1}s  connected  {url}", elapsed_secs(started))?;
@@ -288,16 +371,18 @@ fn watch_session(
     } else {
         state.transition("connected; waiting for validator state", out)?;
     }
-    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
-        stream
-            .set_read_timeout(Some(RETRY_INTERVAL))
-            .context("could not configure monitor refresh interval")?;
-    }
+    socket
+        .get_mut()
+        .set_read_timeout(Some(RETRY_INTERVAL))
+        .context("could not configure monitor refresh interval")?;
 
     loop {
         match socket.read() {
             Ok(Message::Text(payload)) => {
-                handle_text(payload.as_str(), all, started, state, out)?;
+                if handle_text(payload.as_str(), all, stop_when, started, state, out)? {
+                    let _ = socket.close(None);
+                    return Ok(SessionEnd::Running);
+                }
             }
             Ok(Message::Binary(_)) => {
                 if all {
@@ -307,16 +392,23 @@ fn watch_session(
                         elapsed_secs(started)
                     )?;
                     out.flush().context("could not write monitor output")?;
+                } else {
+                    state.tick(out)?;
                 }
             }
             Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {
                 state.tick(out)?;
             }
-            Ok(Message::Close(_)) => return Ok(()),
+            Ok(Message::Close(_)) => {
+                let _ = socket.flush();
+                return Ok(SessionEnd::Disconnected);
+            }
             Err(tungstenite::Error::Io(error)) if is_refresh_timeout(&error) => {
                 state.tick(out)?;
             }
-            Err(error) if is_unavailable_websocket(&error) => return Ok(()),
+            Err(error) if is_unavailable_websocket(&error) => {
+                return Ok(SessionEnd::Disconnected);
+            }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("Firedancer GUI websocket {url} closed"));
@@ -328,10 +420,11 @@ fn watch_session(
 fn handle_text(
     payload: &str,
     all: bool,
+    stop_when: StopWhen,
     started: Instant,
     state: &mut CurrentState,
     out: &mut impl Write,
-) -> Result<()> {
+) -> Result<bool> {
     let elapsed = elapsed_secs(started);
     let Ok(message) = serde_json::from_str::<GuiMessage>(payload) else {
         if all {
@@ -340,7 +433,7 @@ fn handle_text(
         } else {
             state.tick(out)?;
         }
-        return Ok(());
+        return Ok(false);
     };
 
     let name = format!("{}.{}", message.topic, message.key);
@@ -353,12 +446,15 @@ fn handle_text(
                 .unwrap_or_else(|_| message.value.to_string())
         )?;
         out.flush().context("could not write monitor output")?;
-    } else if let Some(phase) = progress_phase(payload) {
-        state.transition(&phase, out)?;
+    } else if is_progress_key(&message.topic, &message.key)
+        && let Some(phase) = message.value.get("phase").and_then(Value::as_str)
+    {
+        state.transition(&humanize_phase(phase), out)?;
+        return Ok(stop_when == StopWhen::Running && phase == "running");
     } else {
         state.tick(out)?;
     }
-    Ok(())
+    Ok(false)
 }
 
 #[derive(Debug)]
@@ -423,6 +519,16 @@ impl CurrentState {
             return Ok(());
         }
         self.render_at(now, out)
+    }
+
+    fn finish(&mut self, out: &mut impl Write) -> Result<()> {
+        if self.live && self.active.is_some() {
+            self.render_at(Instant::now(), out)?;
+            writeln!(out)?;
+            out.flush().context("could not write monitor output")?;
+        }
+        self.active = None;
+        Ok(())
     }
 
     fn render_at(&mut self, now: Instant, out: &mut impl Write) -> Result<()> {
@@ -492,11 +598,12 @@ fn is_unavailable(error: &anyhow::Error) -> bool {
 
 fn is_unavailable_websocket(error: &tungstenite::Error) -> bool {
     match error {
-        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => true,
+        tungstenite::Error::ConnectionClosed => true,
         tungstenite::Error::Io(io_error) => is_unavailable_io(io_error),
-        tungstenite::Error::Http(_)
-        | tungstenite::Error::HttpFormat(_)
-        | tungstenite::Error::Protocol(_) => true,
+        tungstenite::Error::Http(response) => response.status().is_server_error(),
+        tungstenite::Error::Protocol(
+            ProtocolError::HandshakeIncomplete | ProtocolError::ResetWithoutClosingHandshake,
+        ) => true,
         tungstenite::Error::Url(tungstenite::error::UrlError::UnableToConnect(_)) => true,
         _ => false,
     }
@@ -534,8 +641,9 @@ mod tests {
     use tungstenite::{Message, accept};
 
     use super::{
-        CurrentState, GuiEndpoint, connect_address, is_progress_key, is_unavailable,
-        snapshot_state, watch_session, watch_with_retry, websocket_url,
+        CurrentState, GuiEndpoint, SessionEnd, StopWhen, connect_address, connect_socket,
+        is_progress_key, is_unavailable, is_unavailable_websocket, snapshot_state, watch_session,
+        watch_with_retry, websocket_url,
     };
 
     fn serve_one_session(server: TcpListener, payload: &'static str) {
@@ -591,6 +699,23 @@ mod tests {
     }
 
     #[test]
+    fn connects_to_an_ipv6_websocket() -> Result<()> {
+        let server = TcpListener::bind("[::1]:0")?;
+        let addr = server.local_addr()?;
+        let payload = r#"{"topic":"summary","key":"startup_progress","value":{"phase":"running"}}"#;
+        serve_one_session(server, payload);
+
+        // Exercise the config-derived URL through resolution and the actual handshake.
+        let endpoint = GuiEndpoint::from_toml(&format!(
+            "[tiles.gui]\ngui_listen_address = \"::\"\ngui_listen_port = {}\n",
+            addr.port()
+        ))?;
+        let mut socket = connect_socket(&endpoint.websocket_url(), Duration::from_secs(1))?;
+        assert_eq!(socket.read()?, Message::Text(payload.into()));
+        Ok(())
+    }
+
+    #[test]
     fn run_fails_when_gui_is_disabled() {
         let temp = tempfile::TempDir::new().expect("temporary directory");
         let config = temp.path().join("active-fd-config.toml");
@@ -622,6 +747,43 @@ mod tests {
         ))
         .context("could not connect to Firedancer GUI at ws://127.0.0.1:80/websocket");
         assert!(is_unavailable(&error), "{error:#}");
+    }
+
+    #[test]
+    fn abrupt_websocket_close_is_unavailable() {
+        let error = tungstenite::Error::Protocol(
+            tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        );
+        assert!(is_unavailable_websocket(&error));
+    }
+
+    #[test]
+    fn permanent_handshake_error_is_not_retried() {
+        let response = tungstenite::http::Response::builder()
+            .status(404)
+            .body(None::<Vec<u8>>)
+            .expect("HTTP response");
+        assert!(!is_unavailable_websocket(&tungstenite::Error::Http(
+            response
+        )));
+    }
+
+    #[test]
+    fn stalled_handshake_respects_connection_timeout() -> Result<()> {
+        let server = TcpListener::bind("127.0.0.1:0")?;
+        let addr = server.local_addr()?;
+        let thread = thread::spawn(move || {
+            let (_stream, _) = server.accept().expect("accept");
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let started = Instant::now();
+        let error = connect_socket(&format!("ws://{addr}/websocket"), Duration::from_millis(30))
+            .expect_err("stalled handshake should time out");
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert!(is_unavailable(&error), "{error:#}");
+        thread.join().expect("server thread");
+        Ok(())
     }
 
     #[test]
@@ -657,6 +819,7 @@ mod tests {
         watch_session(
             &url,
             false,
+            StopWhen::Never,
             Instant::now(),
             &mut unavailable,
             &mut state,
@@ -691,6 +854,7 @@ mod tests {
         watch_session(
             &url,
             true,
+            StopWhen::Never,
             Instant::now(),
             &mut unavailable,
             &mut state,
@@ -728,9 +892,9 @@ mod tests {
             &url,
             false,
             false,
+            StopWhen::Running,
             &mut output,
             Duration::from_millis(20),
-            Some(2),
         )?;
         thread.join().expect("server thread");
 
@@ -784,6 +948,24 @@ mod tests {
     }
 
     #[test]
+    fn current_state_connects_over_ipv6() -> Result<()> {
+        let server = TcpListener::bind("[::1]:0")?;
+        let url = format!("ws://{}/websocket", server.local_addr()?);
+        serve_one_session(
+            server,
+            r#"{"topic":"summary","key":"startup_progress","value":{"phase":"running"}}"#,
+        );
+        let temp = tempfile::TempDir::new()?;
+        let config = temp.path().join("active-fd-config.toml");
+        std::fs::write(&config, "")?;
+        assert_eq!(
+            snapshot_state(&config, Some(&url), Duration::from_secs(1))?.as_deref(),
+            Some("running")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn current_state_skips_disabled_gui() -> Result<()> {
         let temp = tempfile::TempDir::new()?;
         let config = temp.path().join("active-fd-config.toml");
@@ -830,6 +1012,53 @@ mod tests {
         std::fs::write(&config, config_text)?;
         let state = snapshot_state(&config, None, Duration::from_secs(2))?;
         assert_eq!(state.as_deref(), Some("running"));
+        Ok(())
+    }
+
+    #[test]
+    fn wait_mode_returns_as_soon_as_running_is_reported() -> Result<()> {
+        let server = TcpListener::bind("127.0.0.1:0")?;
+        let addr = server.local_addr()?;
+        let url = format!("ws://{addr}/websocket");
+        let thread = thread::spawn(move || {
+            let (stream, _) = server.accept().expect("accept");
+            let mut socket = accept(stream).expect("websocket handshake");
+            for phase in ["loading_ledger", "running"] {
+                socket
+                    .send(Message::Text(
+                        format!(
+                            r#"{{"topic":"summary","key":"startup_progress","value":{{"phase":"{phase}"}}}}"#
+                        )
+                        .into(),
+                    ))
+                    .expect("send progress");
+            }
+            assert!(
+                matches!(socket.read(), Ok(Message::Close(_))),
+                "client should close after running"
+            );
+        });
+
+        let mut output = Vec::new();
+        let mut unavailable = false;
+        let mut state = CurrentState::new(true);
+        let outcome = watch_session(
+            &url,
+            false,
+            StopWhen::Running,
+            Instant::now(),
+            &mut unavailable,
+            &mut state,
+            &mut output,
+        )?;
+        state.finish(&mut output)?;
+        thread.join().expect("server thread");
+
+        assert_eq!(outcome, SessionEnd::Running);
+        let text = String::from_utf8(output)?;
+        assert!(text.contains("loading ledger"), "{text}");
+        assert!(text.contains("running"), "{text}");
+        assert!(text.ends_with('\n'), "{text:?}");
         Ok(())
     }
 }

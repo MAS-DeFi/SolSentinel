@@ -69,10 +69,15 @@ Runs the full maintenance flow in one locked command:
 2. `make-firedancer` — remove `build/`, then build `fdctl` and `solana`.
 3. `restart-firedancer` — stop the service, configure twice, start, and verify
    the unit is active.
+4. `monitor` — follow GUI boot state until the validator reports `running`.
 
 The validator keeps running through checkout, dependency installation, and the
 clean build. The service is stopped only for the restart segment. Any update or
-build failure exits before touching systemd.
+build failure exits before touching systemd. After systemd reports the service
+active, `update-full` keeps retrying the GUI connection and does not complete
+until startup state reaches `running`.
+The GUI tile must be enabled; `update-full` validates that prerequisite before
+starting checkout or build work.
 
 By default, `update-full` prints compact stage progress on stdout and keeps
 detailed git, dependency, and make output in `val.log`. On an interactive
@@ -87,7 +92,9 @@ pass leaves the service stopped.
 
 ### `update-firedancer <GIT_REF>`
 
-1. Verifies the checkout is a Git working tree.
+1. Verifies the checkout path is the root of a Git working tree. Subdirectories
+   are rejected before making changes; symlinks to the root and linked worktrees
+   are supported.
 2. Fetches tags and refs from `origin`.
 3. Resolves the requested ref to a commit.
 4. If the checkout or its submodules have leftover tracked or untracked
@@ -125,7 +132,9 @@ lines in `val.log`.
 
 ### `restart-firedancer`
 
-Stops the systemd unit if it is running, runs `configure-firedancer` twice, then
+Checks that the built `fdctl` is an executable file and the active config exists
+as a file before stopping the service. Stops the systemd unit if it is running,
+runs `configure-firedancer` twice, then
 starts the unit. Configure is run twice because some Firedancer stages only
 finish after an earlier pass has applied. If the first configure pass fails,
 `val` logs a warning and continues to the second pass. Start runs only when the

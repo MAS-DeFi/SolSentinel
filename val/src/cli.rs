@@ -54,7 +54,7 @@ pub enum Commands {
         git_ref: String,
     },
 
-    /// Run update-firedancer, make-firedancer, then restart-firedancer.
+    /// Update, build, restart, then wait for the validator to report running.
     UpdateFull {
         /// Git tag, branch, or commit to check out.
         #[arg(value_name = "GIT_REF")]

@@ -1,12 +1,15 @@
 #![cfg(unix)]
 
-use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    env, fs, net::TcpListener, os::unix::fs::PermissionsExt, path::Path, process::Command, thread,
+};
 
 use clap::CommandFactory;
 use clap_complete::{generate, shells::Bash};
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
 use tempfile::TempDir;
+use tungstenite::{Message, accept};
 
 #[allow(dead_code)]
 #[path = "../src/cli.rs"]
@@ -364,7 +367,7 @@ esac
 }
 
 #[test]
-fn update_full_runs_update_make_restart_and_prints_compact_progress() {
+fn update_full_runs_all_stages_and_prints_compact_progress() {
     let temp = TempDir::new().expect("temporary directory");
     let bin_dir = temp.path().join("bin");
     let log_dir = temp.path().join("logs");
@@ -397,8 +400,8 @@ esac
 printf '%s\n' "$*" >> "$GIT_LOG"
 case "$1" in
   rev-parse)
-    if [ "$2" = "--is-inside-work-tree" ]; then
-      printf 'true\n'
+    if [ "$2" = "--show-toplevel" ]; then
+      pwd -P
     elif [ "$2" = "--verify" ]; then
       case "$*" in
         *HEAD)
@@ -446,8 +449,27 @@ exit 0
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DEPS_LOG\"\nprintf 'deps-noise\\n'\nprintf 'deps-noise\\n' >&2\n",
     );
 
+    let gui = TcpListener::bind("127.0.0.1:0").expect("GUI listener");
+    let gui_port = gui.local_addr().expect("GUI address").port();
+    let gui_thread = thread::spawn(move || {
+        let (stream, _) = gui.accept().expect("GUI accept");
+        let mut socket = accept(stream).expect("GUI websocket handshake");
+        socket
+            .send(Message::Text(
+                r#"{"topic":"summary","key":"startup_progress","value":{"phase":"running"}}"#
+                    .into(),
+            ))
+            .expect("send running phase");
+    });
+
     let config = temp.path().join("active-fd-config.toml");
-    fs::write(&config, "").expect("Firedancer config");
+    fs::write(
+        &config,
+        format!(
+            "[tiles.gui]\nenabled = true\ngui_listen_address = \"127.0.0.1\"\ngui_listen_port = {gui_port}\n"
+        ),
+    )
+    .expect("Firedancer config");
 
     let deps_log = temp.path().join("deps.log");
     let path = format!(
@@ -485,6 +507,7 @@ exit 0
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    gui_thread.join().expect("GUI thread");
     assert_eq!(
         fs::read_to_string(&state)
             .expect("final service state")
@@ -494,11 +517,13 @@ exit 0
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.contains("[1/3] Update Firedancer (vTEST)"));
+    assert!(stdout.contains("[1/4] Update Firedancer (vTEST)"));
     assert!(stdout.contains("checkout and dependencies"));
     assert!(stdout.contains("in progress"));
-    assert!(stdout.contains("[2/3] Build Firedancer"));
-    assert!(stdout.contains("[3/3] Restart service"));
+    assert!(stdout.contains("[2/4] Build Firedancer"));
+    assert!(stdout.contains("[3/4] Restart service"));
+    assert!(stdout.contains("[4/4] Wait for validator"));
+    assert!(stdout.contains("running"));
     assert!(
         stdout.matches("in progress").count() >= 3,
         "each compact stage should report in progress\nstdout: {stdout}"

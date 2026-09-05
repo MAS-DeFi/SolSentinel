@@ -1,14 +1,18 @@
 //! Firedancer host configuration.
 
-use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
 use crate::process::{CommandSpec, Runner, executable_in, require_success};
 
-/// Initializes all Firedancer host configuration stages.
-pub fn configure_firedancer(runner: &dyn Runner, repository: &Path, config: &Path) -> Result<()> {
+/// Checks configuration prerequisites without modifying the host or service.
+pub fn validate_prerequisites(repository: &Path, config: &Path) -> Result<PathBuf> {
     let fdctl = executable_in(repository, "build/native/gcc/bin/fdctl");
     let metadata = fs::metadata(&fdctl)
         .with_context(|| format!("fdctl binary not found: {}", fdctl.display()))?;
@@ -21,7 +25,12 @@ pub fn configure_firedancer(runner: &dyn Runner, repository: &Path, config: &Pat
     if !config_metadata.is_file() {
         bail!("Firedancer config is not a file: {}", config.display());
     }
+    Ok(fdctl)
+}
 
+/// Initializes all Firedancer host configuration stages.
+pub fn configure_firedancer(runner: &dyn Runner, repository: &Path, config: &Path) -> Result<()> {
+    let fdctl = validate_prerequisites(repository, config)?;
     info!(config = %config.display(), "configuring Firedancer host");
     let command = CommandSpec::new("sudo")
         .arg("--")

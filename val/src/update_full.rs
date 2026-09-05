@@ -10,6 +10,7 @@ use std::{
 use anyhow::Result;
 
 use crate::{
+    monitor,
     paths::AppPaths,
     process::{CompactOutputGuard, Runner},
     progress::{StageProgress, format_duration},
@@ -18,7 +19,7 @@ use crate::{
     service::{ServiceManager, ServiceState},
 };
 
-/// Runs checkout, dependency install, build, and restart in one locked command.
+/// Runs checkout, dependency install, build, restart, and readiness monitoring.
 pub fn update_full(
     runner: &dyn Runner,
     service: &ServiceManager<'_>,
@@ -27,8 +28,17 @@ pub fn update_full(
     service_name: &str,
     compact: bool,
 ) -> Result<()> {
+    monitor::validate_config(&paths.config)?;
     let _compact_guard = compact.then(CompactOutputGuard::enable);
-    run_update_full(runner, service, paths, git_ref, service_name, compact)
+    run_update_full(
+        runner,
+        service,
+        paths,
+        git_ref,
+        service_name,
+        compact,
+        &monitor::wait_until_running,
+    )
 }
 
 fn run_update_full(
@@ -38,6 +48,7 @@ fn run_update_full(
     git_ref: &str,
     service_name: &str,
     compact: bool,
+    wait_for_running: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<()> {
     let started = Instant::now();
     let log_path = paths.log_dir.join("val.log");
@@ -87,11 +98,15 @@ fn run_update_full(
     restart_progress
         .borrow_mut()
         .finalize_start_from_service(service);
-    progress.finish_success(
-        started.elapsed(),
-        build_duration,
-        restart_progress.into_inner(),
-    );
+    let restart_progress = restart_progress.into_inner();
+    progress.finish_restart(&restart_progress);
+    progress.begin_monitor();
+    if let Err(error) = wait_for_running(&paths.config) {
+        progress.fail_monitor(&error);
+        return Err(error);
+    }
+
+    progress.finish_success(started.elapsed(), build_duration, restart_progress);
     Ok(())
 }
 
@@ -99,6 +114,7 @@ enum ServiceImpact {
     Unchanged,
     Stopped,
     FailedToRestart,
+    ReadinessUnknown,
 }
 
 fn classify_restart_failure(service: &ServiceManager<'_>) -> ServiceImpact {
@@ -134,7 +150,7 @@ impl<'a> ProgressReporter<'a> {
 
     fn begin(&mut self) {
         if self.compact {
-            emit_line(&format!("[1/3] Update Firedancer ({})", self.git_ref));
+            emit_line(&format!("[1/4] Update Firedancer ({})", self.git_ref));
             self.current = Some(StageProgress::start(
                 true,
                 "      checkout and dependencies",
@@ -149,7 +165,7 @@ impl<'a> ProgressReporter<'a> {
     fn begin_build(&mut self) {
         debug_assert!(self.current.is_none());
         if self.compact {
-            self.current = Some(StageProgress::start(true, "[2/3] Build Firedancer"));
+            self.current = Some(StageProgress::start(true, "[2/4] Build Firedancer"));
         }
     }
 
@@ -160,7 +176,18 @@ impl<'a> ProgressReporter<'a> {
     fn begin_restart(&mut self) {
         debug_assert!(self.current.is_none());
         if self.compact {
-            self.current = Some(StageProgress::start(true, "[3/3] Restart service"));
+            self.current = Some(StageProgress::start(true, "[3/4] Restart service"));
+        }
+    }
+
+    fn finish_restart(&mut self, restart: &RestartProgress) {
+        self.finish_current("done");
+        restart.write_lines(io::stdout()).ok();
+    }
+
+    fn begin_monitor(&self) {
+        if self.compact {
+            emit_line("[4/4] Wait for validator");
         }
     }
 
@@ -175,7 +202,6 @@ impl<'a> ProgressReporter<'a> {
             return;
         }
 
-        restart.write_lines(io::stdout()).ok();
         emit_line("");
         emit_line(&format!("Update complete: {}", self.git_ref));
         emit_line(&format!(
@@ -208,6 +234,16 @@ impl<'a> ProgressReporter<'a> {
     ) {
         self.finish_current("failed");
         self.fail("restart", error, impact, Some(restart));
+    }
+
+    fn fail_monitor(&mut self, error: &anyhow::Error) {
+        self.finish_current("failed");
+        self.fail(
+            "validator readiness",
+            error,
+            ServiceImpact::ReadinessUnknown,
+            None,
+        );
     }
 
     fn finish_current(&mut self, status: &str) {
@@ -243,6 +279,12 @@ impl<'a> ProgressReporter<'a> {
             ServiceImpact::FailedToRestart => {
                 emit_line(&format!(
                     "Service did not become active ({}).",
+                    self.service
+                ));
+            }
+            ServiceImpact::ReadinessUnknown => {
+                emit_line(&format!(
+                    "Service restart completed, but validator readiness is unknown ({}).",
                     self.service
                 ));
             }
@@ -398,13 +440,16 @@ impl RestartProgress {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque, fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Mutex,
+        cell::Cell, collections::VecDeque, fs, os::unix::fs::PermissionsExt, path::PathBuf,
+        sync::Mutex,
     };
 
     use anyhow::{Result, anyhow};
     use tempfile::TempDir;
 
-    use super::{RestartProgress, ServiceImpact, classify_restart_failure, update_full};
+    use super::{
+        RestartProgress, ServiceImpact, classify_restart_failure, run_update_full, update_full,
+    };
     use crate::{
         paths::AppPaths,
         process::{CommandOutcome, CommandSpec, Runner},
@@ -513,19 +558,19 @@ mod tests {
     }
 
     #[test]
-    fn update_full_runs_update_make_then_restart() -> Result<()> {
+    fn update_full_runs_monitor_after_restart() -> Result<()> {
         let (_temp, paths) = prepared_paths()?;
         let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
         let runner = FakeRunner::new(
             paths.repository.clone(),
             vec![
-                CommandOutcome::success("true\n"),
+                CommandOutcome::success(paths.repository.display().to_string()),
                 CommandOutcome::failure(128, "tag not found"),
                 CommandOutcome::failure(128, "branch not found"),
                 CommandOutcome::success(commit),
                 CommandOutcome::success(commit),
                 CommandOutcome::success(""),
-                CommandOutcome::success("true\n"),
+                CommandOutcome::success(paths.repository.display().to_string()),
                 show("active"),
                 show("inactive"),
                 show("inactive"),
@@ -548,15 +593,22 @@ mod tests {
         );
         let service = ServiceManager::new(&runner, "frankendancer.service", false);
 
-        update_full(
+        let monitored = Cell::new(false);
+        run_update_full(
             &runner,
             &service,
             &paths,
             "v1.2.3",
             "frankendancer.service",
             false,
+            &|config| {
+                assert_eq!(config, paths.config);
+                monitored.set(true);
+                Ok(())
+            },
         )?;
 
+        assert!(monitored.get(), "monitor should run after restart");
         assert!(runner.streaming.lock().expect("stream lock").is_empty());
         assert!(
             runner
@@ -575,13 +627,13 @@ mod tests {
         let runner = FakeRunner::new(
             paths.repository.clone(),
             vec![
-                CommandOutcome::success("true\n"),
+                CommandOutcome::success(paths.repository.display().to_string()),
                 CommandOutcome::failure(128, "tag not found"),
                 CommandOutcome::failure(128, "branch not found"),
                 CommandOutcome::success(commit),
                 CommandOutcome::success(commit),
                 CommandOutcome::success(""),
-                CommandOutcome::success("true\n"),
+                CommandOutcome::success(paths.repository.display().to_string()),
             ],
             vec![
                 CommandOutcome::success(""),
@@ -595,6 +647,39 @@ mod tests {
         );
         let service = ServiceManager::new(&runner, "frankendancer.service", false);
 
+        let monitored = Cell::new(false);
+        let error = run_update_full(
+            &runner,
+            &service,
+            &paths,
+            "v1.2.3",
+            "frankendancer.service",
+            false,
+            &|_| {
+                monitored.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("build failure should abort");
+        assert!(format!("{error:#}").contains("Firedancer build failed"));
+        assert!(!monitored.get(), "monitor must not run after build failure");
+        assert!(
+            runner
+                .interactive
+                .lock()
+                .expect("interactive lock")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_full_rejects_disabled_gui_before_making_changes() -> Result<()> {
+        let (_temp, paths) = prepared_paths()?;
+        fs::write(&paths.config, "[tiles.gui]\nenabled = false\n")?;
+        let runner = FakeRunner::new(paths.repository.clone(), vec![], vec![], vec![]);
+        let service = ServiceManager::new(&runner, "frankendancer.service", false);
+
         let error = update_full(
             &runner,
             &service,
@@ -603,8 +688,14 @@ mod tests {
             "frankendancer.service",
             false,
         )
-        .expect_err("build failure should abort");
-        assert!(format!("{error:#}").contains("Firedancer build failed"));
+        .expect_err("disabled GUI should stop update-full before checkout");
+
+        assert!(
+            format!("{error:#}").contains("GUI is disabled"),
+            "{error:#}"
+        );
+        assert!(runner.captures.lock().expect("capture lock").is_empty());
+        assert!(runner.streaming.lock().expect("stream lock").is_empty());
         assert!(
             runner
                 .interactive

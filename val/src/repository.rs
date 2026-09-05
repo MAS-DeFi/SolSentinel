@@ -174,7 +174,7 @@ fn remove_build_directory(repository: &Path) -> Result<()> {
     }
 }
 
-/// Verifies that the configured path is a Git working tree.
+/// Verifies that the configured path is the root of a Git working tree.
 fn validate_repository(runner: &dyn Runner, repository: &Path) -> Result<()> {
     let metadata = fs::metadata(repository)
         .with_context(|| format!("Firedancer repository not found: {}", repository.display()))?;
@@ -187,11 +187,26 @@ fn validate_repository(runner: &dyn Runner, repository: &Path) -> Result<()> {
 
     let outcome = runner.capture(
         &CommandSpec::new("git")
-            .args(["rev-parse", "--is-inside-work-tree"])
+            .args(["rev-parse", "--show-toplevel"])
             .cwd(repository),
     )?;
-    if !outcome.success || outcome.stdout.trim() != "true" {
+    if !outcome.success || outcome.stdout.is_empty() {
         bail!("path is not a git working tree: {}", repository.display());
+    }
+    let root = Path::new(outcome.stdout.strip_suffix('\n').unwrap_or(&outcome.stdout));
+    let root = fs::canonicalize(root).context("could not resolve Git working tree root")?;
+    let configured = fs::canonicalize(repository).with_context(|| {
+        format!(
+            "could not resolve repository path: {}",
+            repository.display()
+        )
+    })?;
+    if configured != root {
+        bail!(
+            "repository path must be the Git working tree root: {} (root: {})",
+            repository.display(),
+            root.display()
+        );
     }
     Ok(())
 }
@@ -357,7 +372,7 @@ mod tests {
 
     use super::{
         built_fdctl_version, make_firedancer, reset_managed_worktree, resolve_git_ref,
-        update_firedancer, validate_git_ref,
+        update_firedancer, validate_git_ref, validate_repository,
     };
     use crate::process::{CommandOutcome, CommandSpec, Runner, SystemRunner};
 
@@ -484,11 +499,72 @@ mod tests {
     }
 
     #[test]
+    fn rejects_subdirectory_before_update_or_build_changes() -> Result<()> {
+        let repository = TempDir::new()?;
+        init_git_repo(repository.path())?;
+        let subdirectory = repository.path().join("subdirectory");
+        fs::create_dir_all(subdirectory.join("build"))?;
+        let artifact = subdirectory.join("build/artifact");
+        fs::write(&artifact, "keep build\n")?;
+        fs::write(repository.path().join("README"), "keep local edit\n")?;
+        let untracked = repository.path().join("scratch.txt");
+        fs::write(&untracked, "keep untracked\n")?;
+
+        let error = update_firedancer(&SystemRunner, &subdirectory, "HEAD")
+            .expect_err("update must reject a subdirectory before fetching or resetting");
+        assert!(
+            error
+                .to_string()
+                .contains("must be the Git working tree root")
+        );
+        let error = make_firedancer(&SystemRunner, &subdirectory)
+            .expect_err("build must reject a subdirectory before deleting artifacts");
+        assert!(
+            error
+                .to_string()
+                .contains("must be the Git working tree root")
+        );
+        assert_eq!(
+            fs::read_to_string(repository.path().join("README"))?,
+            "keep local edit\n"
+        );
+        assert_eq!(fs::read_to_string(untracked)?, "keep untracked\n");
+        assert_eq!(fs::read_to_string(artifact)?, "keep build\n");
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_roots_symlinks_and_linked_worktrees() -> Result<()> {
+        let temp = TempDir::new()?;
+        let repository = temp.path().join("checkout");
+        init_git_repo(&repository)?;
+        validate_repository(&SystemRunner, &repository)?;
+
+        let link = temp.path().join("linked-checkout");
+        std::os::unix::fs::symlink(&repository, &link)?;
+        validate_repository(&SystemRunner, &link)?;
+
+        let worktree = temp.path().join("worktree");
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                worktree.to_str().context("worktree path")?,
+                "HEAD",
+            ],
+        )?;
+        validate_repository(&SystemRunner, &worktree)?;
+        Ok(())
+    }
+
+    #[test]
     fn update_does_not_discard_changes_when_the_ref_is_missing() -> Result<()> {
         let repository = TempDir::new()?;
         let runner = FakeRunner {
             captures: Mutex::new(VecDeque::from([
-                CommandOutcome::success("true\n"),
+                CommandOutcome::success(repository.path().display().to_string()),
                 CommandOutcome::failure(128, "tag not found"),
                 CommandOutcome::failure(128, "branch not found"),
                 CommandOutcome::failure(128, "ref not found"),
@@ -516,7 +592,7 @@ mod tests {
         let commit = "0123456789012345678901234567890123456789\n";
         let runner = FakeRunner {
             captures: Mutex::new(VecDeque::from([
-                CommandOutcome::success("true\n"),
+                CommandOutcome::success(repository.path().display().to_string()),
                 CommandOutcome::success(commit),
                 CommandOutcome::failure(128, "no HEAD"),
                 CommandOutcome::success(" m agave\n?? local-file\n"),
@@ -577,7 +653,7 @@ mod tests {
         let commit = "0123456789012345678901234567890123456789\n";
         let runner = FakeRunner {
             captures: Mutex::new(VecDeque::from([
-                CommandOutcome::success("true\n"),
+                CommandOutcome::success(repository.path().display().to_string()),
                 CommandOutcome::success(commit),
                 CommandOutcome::failure(128, "no HEAD"),
                 CommandOutcome::success(" m agave\n"),
@@ -622,7 +698,7 @@ mod tests {
         let commit = "0123456789012345678901234567890123456789\n";
         let runner = FakeRunner {
             captures: Mutex::new(VecDeque::from([
-                CommandOutcome::success("true\n"),
+                CommandOutcome::success(repository.path().display().to_string()),
                 CommandOutcome::success(commit),
                 CommandOutcome::failure(128, "no HEAD"),
                 CommandOutcome::success(""),
@@ -676,7 +752,7 @@ mod tests {
         let commit = "0123456789012345678901234567890123456789\n";
         let runner = FakeRunner {
             captures: Mutex::new(VecDeque::from([
-                CommandOutcome::success("true\n"),
+                CommandOutcome::success(repository.path().display().to_string()),
                 CommandOutcome::success(commit),
                 CommandOutcome::failure(128, "no HEAD"),
                 CommandOutcome::success(""),
@@ -828,7 +904,9 @@ mod tests {
         fs::create_dir_all(repository.path().join("opt"))?;
         fs::write(repository.path().join("opt/keep"), "deps\n")?;
         let runner = FakeRunner {
-            captures: Mutex::new(VecDeque::from([CommandOutcome::success("true\n")])),
+            captures: Mutex::new(VecDeque::from([CommandOutcome::success(
+                repository.path().display().to_string(),
+            )])),
             capture_specs: Mutex::new(Vec::new()),
             streaming: Mutex::new(VecDeque::from([CommandOutcome::success("")])),
             streaming_specs: Mutex::new(Vec::new()),
@@ -854,7 +932,9 @@ mod tests {
     fn make_succeeds_when_build_directory_is_absent() -> Result<()> {
         let repository = TempDir::new()?;
         let runner = FakeRunner {
-            captures: Mutex::new(VecDeque::from([CommandOutcome::success("true\n")])),
+            captures: Mutex::new(VecDeque::from([CommandOutcome::success(
+                repository.path().display().to_string(),
+            )])),
             capture_specs: Mutex::new(Vec::new()),
             streaming: Mutex::new(VecDeque::from([CommandOutcome::success("")])),
             streaming_specs: Mutex::new(Vec::new()),

@@ -48,6 +48,7 @@ pub fn restart_firedancer_with_reporter(
     config: &Path,
     reporter: Option<&dyn RestartReporter>,
 ) -> Result<()> {
+    configure::validate_prerequisites(repository, config)?;
     info!("restarting Firedancer (stop, configure, configure, start)");
 
     info!("starting restart segment: stop");
@@ -198,6 +199,62 @@ mod tests {
 
     fn systemctl_spec(action: &str) -> CommandSpec {
         CommandSpec::new("sudo").args(["--", "systemctl", action, "--", "frankendancer.service"])
+    }
+
+    #[test]
+    fn invalid_prerequisites_leave_the_service_untouched() -> Result<()> {
+        for case in [
+            "missing binary",
+            "nonexecutable binary",
+            "missing config",
+            "config directory",
+        ] {
+            let repo = prepared_repo()?;
+            let (repository, config, expected_error) = match case {
+                "missing binary" => (
+                    repo.repository.join("missing"),
+                    repo.config.clone(),
+                    "fdctl binary not found",
+                ),
+                "nonexecutable binary" => {
+                    fs::set_permissions(&repo.fdctl, fs::Permissions::from_mode(0o644))?;
+                    (
+                        repo.repository.clone(),
+                        repo.config.clone(),
+                        "fdctl is not executable",
+                    )
+                }
+                "missing config" => (
+                    repo.repository.clone(),
+                    repo.repository.join("missing.toml"),
+                    "Firedancer config not found",
+                ),
+                _ => (
+                    repo.repository.clone(),
+                    repo.repository.clone(),
+                    "Firedancer config is not a file",
+                ),
+            };
+            let runner = FakeRunner::new(vec![show("active")], vec![CommandOutcome::success("")]);
+            let service = ServiceManager::new(&runner, "frankendancer.service", false);
+
+            let error =
+                restart_firedancer(&runner, &service, &repository, &config).expect_err(case);
+            assert!(
+                error.to_string().contains(expected_error),
+                "{case}: {error:#}"
+            );
+            assert_eq!(
+                runner.unused_captures(),
+                1,
+                "{case}: service should not be queried"
+            );
+            assert!(
+                runner.interactive_commands().is_empty(),
+                "{case}: service should not be stopped"
+            );
+        }
+        Ok(())
     }
 
     #[test]
